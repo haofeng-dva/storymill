@@ -1,0 +1,22 @@
+{
+  "limits": {
+    "max_stories_per_day": 2,
+    "daily_token_budget": 2000000,
+    "approx_tokens_per_story": 500000
+  },
+  "switches": {
+    "new_short_enabled": true,
+    "serial_enabled": false,
+    "auto_replace_enabled": false
+  },
+  "quality": {
+    "quality_min": 4,
+    "native_min": 4,
+    "engagement_min": 3
+  },
+  "notify": {
+    "enabled": false,
+    "channel": "desktop"
+  },
+  "schedule_note": "用 Windows 计划任务分别触发：radar 每6小时，produce-cycle 每30分钟"
+}

@@ -1,0 +1,30 @@
+{
+  "phrases": [
+    "suddenly", "as if", "as though", "somehow", "seemed to", "seemed like",
+    "couldn't help but", "could not help but", "for some reason", "in that moment",
+    "the air was thick", "a shiver ran down", "felt a shiver", "her heart pounded",
+    "his heart raced", "time seemed to", "little did she know", "unknown to"
+  ],
+  "verbs": [
+    "chuckled", "grinned", "sighed", "whispered", "murmured", "muttered",
+    "smirked", "frowned", "nodded slowly", "shrugged", "stared blankly"
+  ],
+  "expressions": [
+    "narrowed his eyes", "narrowed her eyes", "raised an eyebrow", "raised a brow",
+    "furrowed his brow", "furrowed her brow", "bit her lip", "bit his lip",
+    "let out a breath", "let out a breath she didn't know", "clenched his fists",
+    "clenched her fists", "a lump in her throat", "a lump in his throat",
+    "heart sank", "stomach dropped", "blood ran cold"
+  ],
+  "cliche_openers": [
+    "it was a dark and stormy", "the rain fell in sheets", "the sun streamed through",
+    "her alarm clock", "he woke up", "she woke up"
+  ],
+  "cliche_sensory": [
+    "fluorescent lights", "linoleum floor", "stale coffee", "cold coffee",
+    "old coffee", "floor wax", "damp uniforms", "paper cup",
+    "the air smelled of", "the air was thick with"
+  ],
+  "em_dash_per_1000": 8,
+  "note": "写后校验：正文中出现以上短语/动词/表情按全篇密度统计，超阈值触发重写；cliche_sensory 是盲评发现的 AI 模板感观词"
+}

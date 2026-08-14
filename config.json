@@ -1,0 +1,32 @@
+{
+  "llm": {
+    "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+    "api_key_env": "ARK_API_KEY",
+    "models": {
+      "writer": "gpt-5.5",
+      "outline": "gpt-5.5",
+      "reviewer": "glm-5-2-260617",
+      "cn_summary": "deepseek-v4-flash-260425",
+      "radar": "deepseek-v4-flash-260425"
+    },
+    "note": "writer/outline 用 gpt-5.5（直连无需代理，母语级）；gemini-3.1-pro 需代理，代理开时可切回；reviewer 保留 glm（native_check 盲评已 GPT 优先）"
+  },
+  "writing": {
+    "default_chapters": 12,
+    "default_words": 700,
+    "word_min": 620,
+    "word_max": 780,
+    "max_rewrite": 3,
+    "temperature": 0.85
+  },
+  "genre_keywords": {
+    "domestic_suspense": ["suspense", "thriller", "crime", "mystery", "noir", "forensic", "murder"],
+    "webfiction": ["fantasy", "litrpg", "progression", "isekai", "romantasy", "cultivation", "time loop", "system", "dungeon"],
+    "literary": ["literary", "contemporary", "family drama", "coming of age"]
+  },
+  "paths": {
+    "anchor_examples": "anchor_examples",
+    "output": "shorts",
+    "probe": "probe"
+  }
+}

@@ -1,0 +1,29 @@
+# ===== 密钥（绝不提交）=====
+.env
+keys.local.json
+*.pem
+*.key
+
+# ===== 运行时产物 =====
+logs/
+shorts/
+out/
+directions/
+probe/
+radar_en/
+state.db
+*.db
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== 临时/日志 =====
+*.out
+*.err
+*_test_*.py
+_test*.py
+_strict_*.py
+_probe_*.py
+_diag_*.py
