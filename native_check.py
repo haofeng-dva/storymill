@@ -240,39 +240,58 @@ def parse_verdict(content):
 
 
 class QualityJudge:
-    """质量盲评评委：GPT 优先（更准，实测能区分真人5/AI3-4），Gemini 兑底。"""
+    """质量盲评评委：GLM 优先（国内直连稳定，实测真人5/AI2 不误杀不放水），GPT 兜底，Gemini 最后。"""
 
     def __init__(self, env):
         self.gpt = GPTNativeReviewer(env)
         self.gemini = GeminiReviewer(env)
+        self.glm = DeepSeekReviewer(load_json(os.path.join(HERE, "config.json")))
 
-    def blind(self, text):
-        """返回 (naturalness 0-5, 原始评语, provider)。"""
-        content = ""
-        provider = "gpt"
-        r = self.gpt._call([
-            {"role": "developer", "content": "You are a literary critic. Reply strictly: verdict ai|human, naturalness 1-5, reason."},
-            {"role": "user", "content": ("Read this English fiction chapter.\n"
+    @staticmethod
+    def _blind_prompt(sample):
+        return ("Read this English fiction chapter.\n"
                 "verdict: ai|human\n"
                 "naturalness: 1-5\n"
                 "reason: if ai, name the specific AI-tell to avoid (one phrase starting with 'avoid'); if human, say 'natural'\n\n"
-                + text[:1200])},
+                + sample)
+
+    def blind(self, text):
+        """返回 (naturalness 0-5, 原始评语, provider)。
+        长章节（>1300 字符）用头尾采样：前 900 + 末 600，避免只评开头遗漏结尾退化。
+        降级链：GLM（国内稳定）→ GPT → Gemini。"""
+        if len(text) <= 1300:
+            sample = text
+        else:
+            sample = text[:900] + "\n[...section omitted for review...]\n" + text[-600:]
+        # 1) GLM：国内直连，稳定，不依赖中转
+        r = self.glm.llm.chat("reviewer", [
+            {"role": "system", "content": "You are a literary critic. Reply strictly: verdict ai|human, naturalness 1-5, reason."},
+            {"role": "user", "content": self._blind_prompt(sample)},
+        ], max_tokens=1200, temperature=0.3)
+        content = r.get("content", "")
+        if "error" not in r and content.strip():
+            m = re.search(r"naturalness\s*:\s*([1-5])", content)
+            if m:
+                return int(m.group(1)), content, "glm"
+        # 2) GPT 兜底
+        r = self.gpt._call([
+            {"role": "developer", "content": "You are a literary critic. Reply strictly: verdict ai|human, naturalness 1-5, reason."},
+            {"role": "user", "content": self._blind_prompt(sample)},
         ])
         content = r.get("content", "")
-        if not content.strip():
-            provider = "gemini"
-            r2 = self.gemini._call(
-                "You are a literary critic. Reply strictly: verdict ai|human, naturalness 1-5, reason.",
-                ("Read this English fiction chapter.\n"
-                 "verdict: ai|human\n"
-                 "naturalness: 1-5\n"
-                 "reason: if ai, name the specific AI-tell to avoid (one phrase starting with 'avoid'); if human, say 'natural'\n\n"
-                 + text[:1200]),
-            )
-            content = r2.get("content", "")
+        if content.strip():
+            m = re.search(r"naturalness\s*:\s*([1-5])", content)
+            if m:
+                return int(m.group(1)), content, "gpt"
+        # 3) Gemini 最后兜底
+        r2 = self.gemini._call(
+            "You are a literary critic. Reply strictly: verdict ai|human, naturalness 1-5, reason.",
+            self._blind_prompt(sample),
+        )
+        content = r2.get("content", "")
         m = re.search(r"naturalness\s*:\s*([1-5])", content)
         score = int(m.group(1)) if m else 3
-        return score, content, provider
+        return score, content, "gemini"
 
 
 def parse_scores(content):

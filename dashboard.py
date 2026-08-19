@@ -143,6 +143,18 @@ def download_file(story_id, filename):
     return open(target, "rb").read(), os.path.basename(target)
 
 
+def preview_chapter(story_id, ch=1):
+    """预览第一章：读 shorts/{story_id}/ch0001.md，转成简单 HTML。"""
+    import html as _html
+    path = os.path.join(HERE, "shorts", story_id, f"ch{int(ch):04d}.md")
+    if not os.path.isfile(path):
+        return None
+    text = open(path, encoding="utf-8").read()
+    paras = [f"<p>{_html.escape(p.strip())}</p>" for p in text.split("\n\n") if p.strip()]
+    body = "".join(paras)
+    return f"<h3 style='font-family:var(--font-serif);color:var(--text);margin:0 0 12px'>Chapter {int(ch)} 预览</h3><div style='font-family:var(--font-serif);font-size:0.92rem;line-height:1.7;color:var(--text-light)'>{body}</div>"
+
+
 def adopt(rec_id):
     """采纳推荐：生成方向文件 + 标记 adopted。"""
     store = StateStore()
@@ -267,6 +279,15 @@ HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
+<div id="previewOverlay" style="position:fixed;inset:0;background:rgba(42,38,34,0.5);z-index:98;display:none;align-items:center;justify-content:center;">
+  <div style="background:var(--card);border:1px solid var(--accent);border-radius:6px;padding:20px 24px;max-width:640px;width:92%;max-height:80vh;display:flex;flex-direction:column;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <span id="previewTitle" style="font-weight:500;color:var(--accent-deep);font-size:0.9rem;"></span>
+      <button class="btn" onclick="closePreview()">关闭</button>
+    </div>
+    <div id="previewBody" style="overflow-y:auto;"></div>
+  </div>
+</div>
 <div id="keyOverlay" style="position:fixed;inset:0;background:rgba(245,239,228,0.98);z-index:99;display:none;align-items:center;justify-content:center;">
   <div style="background:var(--card);border:1px solid var(--accent);border-radius:6px;padding:28px 32px;max-width:480px;width:90%;">
     <h2 style="margin-bottom:8px;">配置 API Key</h2>
@@ -385,7 +406,7 @@ async function load() {
       } ${o.manifest ? `<a class="dl" href="/api/download?story=${o.storyId}&file=publish_manifest.json">⬇ 发布清单</a>` : ''}</span></div>`).join('')
     : '<div class="empty">暂无产物（跑完生产+包装才有）</div>';
   document.getElementById('stories').innerHTML = s.stories.length
-    ? s.stories.map(st => `<div class="row"><span>${st.storyId}</span><span class="tag">${st.chapters} 章</span></div>`).join('')
+    ? s.stories.map(st => `<div class="row"><span>${st.storyId}</span><span class="tag">${st.chapters} 章 <a class="dl" href="javascript:void(0)" onclick="preview('${st.storyId}',1)">预览第一章</a></span></div>`).join('')
     : '<div class="empty">暂无故事</div>';
   document.getElementById('switches').innerHTML = Object.entries(s.switches).map(([k,v]) =>
     `<div class="row"><span>${k}</span><button class="btn ${v?'on':'off'}" onclick="act('toggle','${k}')">${v?'开启':'关闭'}</button></div>`).join('');
@@ -402,6 +423,18 @@ async function act(op, id) {
   const j = await r.json();
   document.getElementById('actionMsg').textContent = j.msg || JSON.stringify(j);
   load();
+}
+async function preview(storyId, ch) {
+  const r = await fetch('/api/preview?story=' + storyId + '&ch=' + ch);
+  if (!r.ok) { document.getElementById('actionMsg').textContent = '该故事没有第一章（还没写完）'; return; }
+  const html = await r.text();
+  const ov = document.getElementById('previewOverlay');
+  document.getElementById('previewBody').innerHTML = html;
+  document.getElementById('previewTitle').textContent = storyId + ' · 预览';
+  ov.style.display = 'flex';
+}
+function closePreview() {
+  document.getElementById('previewOverlay').style.display = 'none';
 }
 async function saveThresh() {
   const r = await fetch('/api/threshold?qmin=' + document.getElementById('qmin').value +
@@ -454,6 +487,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Content-Disposition", f'attachment; filename="{name}"')
                 self.end_headers()
                 self.wfile.write(data)
+        elif u.path == "/api/preview":
+            q = parse_qs(u.query)
+            body = preview_chapter(q.get("story", [""])[0], q.get("ch", [1])[0])
+            if body is None:
+                self._send(json.dumps({"error": "not found"}), 404)
+            else:
+                self._send(body, ctype="text/html; charset=utf-8")
         else:
             self._send(json.dumps({"error": "not found"}), 404)
 

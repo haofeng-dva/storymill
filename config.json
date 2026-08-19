@@ -7,17 +7,19 @@
       "outline": "gpt-5.5",
       "reviewer": "glm-5-2-260617",
       "cn_summary": "deepseek-v4-flash-260425",
-      "radar": "deepseek-v4-flash-260425"
+      "radar": "deepseek-v4-flash-260425",
+      "handoff": "deepseek-v4-flash-260425"
     },
-    "note": "writer/outline 用 gpt-5.5（直连无需代理，母语级）；gemini-3.1-pro 需代理，代理开时可切回；reviewer 保留 glm（native_check 盲评已 GPT 优先）"
+    "note": "writer/outline 用 gpt-5.5（直连无需代理，母语级）；gemini-3.1-pro 需代理，代理开时可切回；reviewer 保留 glm（native_check 盲评已 GPT 优先）；大纲长输出走分段 write_outline_segmented 绕 504"
   },
   "writing": {
     "default_chapters": 12,
-    "default_words": 700,
-    "word_min": 620,
-    "word_max": 780,
+    "default_words": 2000,
+    "word_band": 0.1,
     "max_rewrite": 3,
-    "temperature": 0.85
+    "temperature": 0.85,
+    "serial_mode": true,
+    "parallel_blocks": 1
   },
   "genre_keywords": {
     "domestic_suspense": ["suspense", "thriller", "crime", "mystery", "noir", "forensic", "murder"],

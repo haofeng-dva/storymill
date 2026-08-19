@@ -20,7 +20,7 @@ import re
 import zipfile
 from datetime import datetime, timezone
 
-from engine import LLM, load_json
+from engine import LLM, load_json, load_env
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -161,6 +161,7 @@ def main():
     args = ap.parse_args()
 
     cfg = load_json(os.path.join(HERE, "config.json"))
+    load_env()
     llm = LLM(cfg)
 
     short_dir = os.path.join(HERE, "shorts", args.story_id)

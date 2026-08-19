@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>storymill 全流程示意图（含标注解释）</title>
+<style>
+  body { font-family: Georgia, 'Noto Serif SC', 'Songti SC', serif; background: #F5EFE4; color: #2A2622; padding: 32px; max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; font-weight: 500; color: #1B365D; border-left: 3px solid #537D96; padding-left: 10px; margin-bottom: 4px; }
+  .sub { color: #6B6158; font-size: 0.85rem; margin-bottom: 24px; }
+  svg { width: 100%; height: auto; background: #FBF7EE; border: 0.5px solid #D8CFBE; border-radius: 4px; }
+  h2 { font-size: 1.05rem; font-weight: 500; color: #1B365D; border-left: 3px solid #537D96; padding-left: 8px; margin-top: 28px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.88rem; margin-top: 8px; }
+  th { text-align: left; font-weight: 500; color: #4A433C; padding: 7px 9px; border-bottom: 1px solid #D8CFBE; }
+  td { padding: 6px 9px; border-bottom: 0.5px solid rgba(0,0,0,0.06); color: #2A2622; vertical-align: top; }
+  .sw { display: inline-block; width: 13px; height: 13px; border-radius: 2px; margin-right: 6px; vertical-align: -2px; }
+</style>
+</head>
+<body>
+<h1>storymill 全流程示意图</h1>
+<div class="sub">对应文档：docs/10_实现细节详解.md · 生成时间 2026-08-17</div>
+
+<svg viewBox="0 0 900 470" xmlns="http://www.w3.org/2000/svg" role="img">
+  <title>storymill 全流程示意图</title>
+  <desc>九阶段主流程，分章写作与质量门槛闭环，以及输入输出存储</desc>
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#537D96"/>
+    </marker>
+    <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#9D5F4D"/>
+    </marker>
+    <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#4A6B4A"/>
+    </marker>
+  </defs>
+  <text x="30" y="16" font-family="Georgia,serif" font-size="13" font-weight="500" fill="#1B365D">主流程 · 八工位</text>
+  <rect x="30" y="25" width="150" height="44" rx="2" fill="rgba(83,125,150,0.08)" stroke="#537D96" stroke-width="1"/>
+  <text x="105" y="52" text-anchor="middle" font-family="Georgia,serif" font-size="13" font-weight="500" fill="#2A2622">选品 radar</text>
+  <line x1="184" y1="47" x2="224" y2="47" stroke="#537D96" stroke-width="1" marker-end="url(#ar)"/>
+  <rect x="228" y="25" width="150" height="44" rx="2" fill="rgba(83,125,150,0.08)" stroke="#537D96" stroke-width="1"/>
+  <text x="303" y="52" text-anchor="middle" font-family="Georgia,serif" font-size="13" font-weight="500" fill="#2A2622">方向管理</text>
+  <line x1="382" y1="47" x2="422" y2="47" stroke="#537D96" stroke-width="1" marker-end="url(#ar)"/>
+  <rect x="426" y="25" width="150" height="44" rx="2" fill="rgba(83,125,150,0.08)" stroke="#537D96" stroke-width="1"/>
+  <text x="501" y="52" text-anchor="middle" font-family="Georgia,serif" font-size="13" font-weight="500" fill="#2A2622">大纲 outline</text>
+  <line x1="580" y1="47" x2="620" y2="47" stroke="#537D96" stroke-width="1" marker-end="url(#ar)"/>
+  <rect x="624" y="25" width="150" height="44" rx="2" fill="rgba(83,125,150,0.08)" stroke="#537D96" stroke-width="1"/>
+  <text x="699" y="52" text-anchor="middle" font-family="Georgia,serif" font-size="13" font-weight="500" fill="#2A2622">设定圣经</text>
+  <path d="M 699 69 L 699 90 L 105 90 L 105 69" fill="none" stroke="#537D96" stroke-width="1" marker-end="url(#ar)"/>
+  <rect x="30" y="105" width="150" height="44" rx="2" fill="#1B365D" stroke="#1B365D" stroke-width="1"/>
+  <text x="105" y="132" text-anchor="middle" font-family="Georgia,serif" font-size="13" font-weight="500" fill="#FFFDF7">分章写作 ★</text>
+  <line x1="184" y1="127" x2="224" y2="127" stroke="#537D96" stroke-width="1" marker-end="url(#ar)"/>
+  <rect x="228" y="105" width="150" height="44" rx="2" fill="rgba(83,125,150,0.08)" stroke="#537D96" stroke-width="1"/>
+  <text x="303" y="132" text-anchor="middle" font-family="Georgia,serif" font-size="13" font-weight="500" fill="#2A2622">质检拦截</text>
+  <line x1="382" y1="127" x2="422" y2="127" stroke="#537D96" stroke-width="1" marker-end="url(#ar)"/>
+  <rect x="426" y="105" width="150" height="44" rx="2" fill="rgba(83,125,150,0.08)" stroke="#537D96" stroke-width="1"/>
+  <text x="501" y="132" text-anchor="middle" font-family="Georgia,serif" font-size="13" font-weight="500" fill="#2A2622">包装 EPUB</text>
+  <line x1="580" y1="127" x2="620" y2="127" stroke="#537D96" stroke-width="1" marker-end="url(#ar)"/>
+  <rect x="624" y="105" width="150" height="44" rx="2" fill="rgba(83,125,150,0.08)" stroke="#537D96" stroke-width="1"/>
+  <text x="699" y="132" text-anchor="middle" font-family="Georgia,serif" font-size="13" font-weight="500" fill="#2A2622">调度看板</text>
+  <text x="30" y="180" font-family="Georgia,serif" font-size="13" font-weight="500" fill="#1B365D">分章写作内部 · 质量门槛闭环</text>
+  <rect x="30" y="190" width="180" height="52" rx="2" fill="rgba(83,125,150,0.08)" stroke="#537D96" stroke-width="1"/>
+  <text x="120" y="213" text-anchor="middle" font-family="Georgia,serif" font-size="12" fill="#2A2622">模型分段写一章</text>
+  <text x="120" y="230" text-anchor="middle" font-family="Georgia,serif" font-size="11" fill="#6B6158">GPT 300词/段 + 冷却</text>
+  <line x1="214" y1="216" x2="254" y2="216" stroke="#537D96" stroke-width="1" marker-end="url(#ar)"/>
+  <rect x="258" y="190" width="180" height="52" rx="2" fill="rgba(83,125,150,0.08)" stroke="#537D96" stroke-width="1"/>
+  <text x="348" y="213" text-anchor="middle" font-family="Georgia,serif" font-size="12" fill="#2A2622">程序数字数</text>
+  <text x="348" y="230" text-anchor="middle" font-family="Georgia,serif" font-size="11" fill="#6B6158">620-1320 区间硬校验</text>
+  <path d="M 348 190 L 348 172 L 120 172 L 120 190" fill="none" stroke="#9D5F4D" stroke-width="1" marker-end="url(#ar2)"/>
+  <text x="225" y="166" text-anchor="middle" font-family="Georgia,serif" font-size="11" fill="#9D5F4D">字数不足 · 带具体反馈重写</text>
+  <line x1="442" y1="216" x2="482" y2="216" stroke="#537D96" stroke-width="1" marker-end="url(#ar)"/>
+  <rect x="486" y="190" width="180" height="52" rx="2" fill="rgba(83,125,150,0.08)" stroke="#537D96" stroke-width="1"/>
+  <text x="576" y="213" text-anchor="middle" font-family="Georgia,serif" font-size="12" fill="#2A2622">质量盲评 GPT</text>
+  <text x="576" y="230" text-anchor="middle" font-family="Georgia,serif" font-size="11" fill="#6B6158">naturalness &lt;4 不通过</text>
+  <path d="M 576 190 L 576 160 L 660 160 L 660 173" fill="none" stroke="#9D5F4D" stroke-width="1" marker-end="url(#ar2)"/>
+  <rect x="670" y="163" width="190" height="34" rx="2" fill="rgba(157,95,77,0.08)" stroke="#9D5F4D" stroke-width="1"/>
+  <text x="765" y="184" text-anchor="middle" font-family="Georgia,serif" font-size="11" fill="#9D5F4D">沉淀 lessons.json · 书内自学习</text>
+  <path d="M 855 180 L 872 180 L 872 216 L 670 216" fill="none" stroke="#9D5F4D" stroke-width="1" marker-end="url(#ar2)"/>
+  <text x="762" y="206" text-anchor="middle" font-family="Georgia,serif" font-size="11" fill="#9D5F4D">带原因重写</text>
+  <line x1="670" y1="216" x2="700" y2="216" stroke="#4A6B4A" stroke-width="1" marker-end="url(#ar)"/>
+  <text x="782" y="242" text-anchor="middle" font-family="Georgia,serif" font-size="12" font-weight="500" fill="#4A6B4A">≥4 通过 → 进质检</text>
+  <line x1="765" y1="252" x2="765" y2="262" stroke="#4A6B4A" stroke-width="1"/>
+  <line x1="765" y1="262" x2="303" y2="262" stroke="#4A6B4A" stroke-width="1" marker-end="url(#ar)"/>
+  <text x="30" y="296" font-family="Georgia,serif" font-size="13" font-weight="500" fill="#1B365D">数据存放</text>
+  <rect x="30" y="306" width="250" height="44" rx="2" fill="rgba(83,125,150,0.08)" stroke="#537D96" stroke-width="1"/>
+  <text x="155" y="325" text-anchor="middle" font-family="Georgia,serif" font-size="12" font-weight="500" fill="#2A2622">输入</text>
+  <text x="155" y="342" text-anchor="middle" font-family="Georgia,serif" font-size="11" fill="#6B6158">rec_N.txt · config.json · 词表 · keys</text>
+  <rect x="310" y="306" width="250" height="44" rx="2" fill="rgba(157,95,77,0.08)" stroke="#9D5F4D" stroke-width="1"/>
+  <text x="435" y="325" text-anchor="middle" font-family="Georgia,serif" font-size="12" font-weight="500" fill="#9D5F4D">中间产物</text>
+  <text x="435" y="342" text-anchor="middle" font-family="Georgia,serif" font-size="11" fill="#6B6158">outline · world_bible · lessons</text>
+  <rect x="590" y="306" width="250" height="44" rx="2" fill="rgba(74,107,74,0.08)" stroke="#4A6B4A" stroke-width="1"/>
+  <text x="715" y="325" text-anchor="middle" font-family="Georgia,serif" font-size="12" font-weight="500" fill="#4A6B4A">输出</text>
+  <text x="715" y="342" text-anchor="middle" font-family="Georgia,serif" font-size="11" fill="#6B6158">ch*.md · EPUB · 发布清单 · 摘要</text>
+  <rect x="30" y="364" width="810" height="46" rx="2" fill="#FAF9F5" stroke="#D8CFBE" stroke-width="0.5"/>
+  <text x="435" y="384" text-anchor="middle" font-family="Georgia,serif" font-size="12" fill="#4A433C">分工哲学：模型负责想（大纲 / 圣经 / 写章），程序负责查（数字数 / 判达标 / 管教训）</text>
+  <text x="435" y="401" text-anchor="middle" font-family="Georgia,serif" font-size="11" fill="#6B6158">可靠的部分管住不可靠的部分 · 每章写后盲评重写 · 失败教训回灌本书</text>
+</svg>
+
+<h2>图例与标注解释</h2>
+<table>
+  <tr><th style="width:180px">元素 / 颜色</th><th>含义</th></tr>
+  <tr><td><span class="sw" style="background:#537D96"></span>蓝色方块 + 箭头</td><td>主流程的八个工位及流转方向：选品 → 方向 → 大纲 → 圣经 → 分章写作 → 质检 → 包装 → 调度</td></tr>
+  <tr><td><span class="sw" style="background:#1B365D"></span>深蓝方块（分章写作★）</td><td>核心工位，整条流水线的"心脏"，内部有质量门槛闭环</td></tr>
+  <tr><td><span class="sw" style="background:#9D5F4D"></span>赭色回环箭头</td><td>两个"不合格重写"回路：① 字数不足带反馈重写；② 盲评不达标带原因重写，并沉淀到本书 lessons.json</td></tr>
+  <tr><td><span class="sw" style="background:#4A6B4A"></span>绿色箭头</td><td>达标路径：naturalness ≥4 的章节通过，进入质检环节</td></tr>
+  <tr><td>「模型分段写一章」</td><td>GPT-5.5 每段写 300 词、段间冷却 3 秒，规避中转 60 秒超时；1200 词章节自动切成 4 段</td></tr>
+  <tr><td>「程序数字数」</td><td>程序用正则数英文单词数，硬校验区间（默认 620-780，1200 词模式为 1080-1320），不达标生成具体反馈重写</td></tr>
+  <tr><td>「质量盲评 GPT」</td><td>由另一个模型（GPT 优先、Gemini 兜底）盲评 naturalness（自然度 1-5），不达标（&lt;4）触发重写</td></tr>
+  <tr><td>「沉淀 lessons.json」</td><td>盲评失败的原因（verdict=ai 时）提取为"avoid 词条"存进本书教训库，下一章写作自动注入，实现书内自学习</td></tr>
+  <tr><td>输入（底部蓝框）</td><td>方向文件 rec_N.txt、系统配置 config.json、AI 味词表、密钥 keys.local.json</td></tr>
+  <tr><td>中间产物（底部赭框）</td><td>大纲 outline.md、设定圣经 world_bible.md、本书教训库 lessons.json</td></tr>
+  <tr><td>输出（底部绿框）</td><td>章节 ch0001-0012.md、合订 full.md、中文摘要、EPUB 电子书、发布清单 publish_manifest</td></tr>
+</table>
+
+<h2>各阶段职责速查</h2>
+<table>
+  <tr><th>阶段</th><th>做什么</th><th>关键实现</th></tr>
+  <tr><td>1 选品 radar</td><td>抓榜单、抠书名/简介/标签、LLM 统计题材分布 + 找空位 + 推荐</td><td>正则解析 HTML、关键词粗分类、LLM 严格 JSON 输出、24 小时去重</td></tr>
+  <tr><td>2 方向管理</td><td>把推荐转成方向文件</td><td>一行拼接 "题材: 创意"，写 rec_N.txt，标记已采纳</td></tr>
+  <tr><td>3 大纲</td><td>生成 logline / 主角 / 三幕 / 逐章节拍</td><td>每章强制 2-3 场景节拍 + 对话 + 细节揭示（字数达标根因）</td></tr>
+  <tr><td>4 设定圣经</td><td>生成力量体系 / 世界规则 / 人物卡</td><td>写章时逐章注入，标注 MUST stay consistent 防前后矛盾</td></tr>
+  <tr><td>5 分章写作 ★</td><td>分段续写 + 字数硬校验 + 质量门槛</td><td>300 词/段续写、程序数词、GPT 盲评重写、lessons 沉淀</td></tr>
+  <tr><td>6 质检拦截</td><td>审稿评分（地道性/精彩度）+ 降级链</td><td>GPT→GLM→Gemini 降级，低于阈值 exit 2 拦截不包装</td></tr>
+  <tr><td>7 包装</td><td>生成 EPUB + 发布清单</td><td>zipfile 手写 EPUB（mimetype 不压缩），清单含 AI 披露</td></tr>
+  <tr><td>8 调度看板</td><td>限流 + 编排 + 前端控制</td><td>日产量/token 预算检查，Web 看板一键开始/暂停/下载</td></tr>
+</table>
+</body>
+</html>
