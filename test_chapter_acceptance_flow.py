@@ -1,0 +1,201 @@
+# -*- coding: utf-8 -*-
+"""Flow tests for the chapter acceptance transaction; no provider calls."""
+import hashlib
+import json
+import shutil
+import sys
+import unittest
+import uuid
+from pathlib import Path
+from unittest.mock import patch
+
+import engine as engine_module
+from chapter_state import ChapterStatus
+
+
+INITIAL_TEXT = "Alpha beta gamma cited wrong eta theta iota kappa lambda."
+REPAIRED_TEXT = "Alpha beta gamma cited fixed eta theta iota kappa lambda."
+REQUIREMENTS = [{"id": "ch0001-requirement-01", "requirement": "The required event occurs."}]
+
+
+class _FakeLLM:
+    models = {}
+
+    def set_run_context(self, *_args, **_kwargs):
+        pass
+
+    def set_chapter_context(self, *_args, **_kwargs):
+        pass
+
+    def set_call_context(self, *_args, **_kwargs):
+        pass
+
+    def chat(self, role, _messages, **_kwargs):
+        if role == "writer":
+            return {"content": json.dumps({
+                "patches": [{"find": "cited wrong", "replace": "cited fixed"}],
+            })}
+        return {"content": "handoff"}
+
+
+class _FakeEngine(engine_module.WritingEngine):
+    def __init__(self):
+        self.cfg = {"paths": {"output": "shorts"}}
+        self.w = {
+            "default_chapters": 2, "default_words": 10, "word_band": 0,
+            "word_min": 10, "word_max": 10, "parallel_blocks": 1,
+            "max_rewrite": 0, "recovery_rounds": 0, "recovery_wait_seconds": 0,
+        }
+        self.llm = _FakeLLM()
+        self.anchor_examples = []
+        self.experience_runtime = type("Experience", (), {"enabled": True})()
+
+    def set_genre(self, _direction, _genre):
+        return None
+
+    def experience_block(self, _chapter_no):
+        return "", []
+
+    def write_outline(self, _direction):
+        return {"content": "Chapter 1\n- The required event occurs.", "elapsed": 0}
+
+    def write_world_bible(self, _direction, _outline):
+        return {"content": "test bible", "elapsed": 0}
+
+    def write_with_retry(self, *_args, **_kwargs):
+        return {"text": INITIAL_TEXT, "words": 10, "elapsed": 0, "rewrites": 0}
+
+    def ai_tell_check(self, _text):
+        return [], {}
+
+    def generate_handoff(self, _text):
+        return {"content": "handoff"}
+
+    def generate_cn_summary(self, *_args):
+        return {"content": "test summary"}
+
+
+class _FakeStateStore:
+    def __init__(self):
+        self.rows = {}
+        self.finished = []
+
+    def start_run(self, *_args, **_kwargs):
+        pass
+
+    def finish_run(self, *args, **_kwargs):
+        self.finished.append(args)
+
+    def upsert_chapter_task(self, run_id, story_id, chapter_no, status, **fields):
+        row = self.rows.setdefault(chapter_no, {"run_id": run_id, "story_id": story_id, "chapter_no": chapter_no})
+        row.update({"status": status, **fields})
+
+    def chapter_tasks(self, _run_id):
+        return [self.rows[number].copy() for number in sorted(self.rows)]
+
+
+class _FakeBookMemory:
+    def __init__(self, *_args):
+        pass
+
+    def context_block(self, _chapter_no):
+        return ""
+
+    def save_chapter(self, *_args, **_kwargs):
+        pass
+
+
+class _Judge:
+    def __init__(self, *_args):
+        pass
+
+    def blind(self, _text):
+        return 5, "verdict: human", "test"
+
+
+def _review(text, findings):
+    return {
+        "source_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "outcomes": [{"id": REQUIREMENTS[0]["id"], "status": "met"}],
+        "findings": findings,
+    }
+
+
+class ChapterAcceptanceFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(".chapter-acceptance-flow-" + uuid.uuid4().hex)
+        self.root.mkdir()
+        self.store = _FakeStateStore()
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _run_flow(self, reviews, chapters):
+        self.reviewed_names = []
+
+        def fake_review(name, text, _requirements, _reviewers):
+            self.assertFalse((self.root / "shorts" / "flow" / "ch0001.md").exists())
+            self.reviewed_names.append(name)
+            return reviews.pop(0)(text)
+
+        with patch.object(engine_module, "HERE", str(self.root)), \
+             patch.object(engine_module, "WritingEngine", _FakeEngine), \
+             patch.object(engine_module, "StateStore", return_value=self.store), \
+             patch.object(engine_module, "BookMemory", _FakeBookMemory), \
+             patch.object(engine_module, "load_env"), \
+             patch.object(engine_module, "load_json", return_value={"chapter_acceptance": {"enabled": True, "max_repair_rounds": 1}}), \
+             patch.object(engine_module, "load_lessons", return_value=[]), \
+             patch.object(engine_module.progress, "update"), \
+             patch("native_check.QualityJudge", _Judge), \
+             patch("native_check.build_acceptance_reviewers", return_value=[]), \
+             patch("native_check.extract_chapter_requirements", return_value=REQUIREMENTS), \
+             patch("native_check.review_chapter_acceptance", side_effect=fake_review), \
+             patch.object(sys, "argv", ["engine.py", "--direction", "test", "--story-id", "flow", "--chapters", str(chapters), "--words", "10"]):
+            return engine_module.main()
+
+    def test_repair_then_recheck_passes_before_writing_chapter(self):
+        findings = [{
+            "category": "clarity_idiomaticity", "reason": "wording is wrong",
+            "repair_scope": "sentence", "evidence_quotes": ["cited wrong"],
+        }]
+        result = self._run_flow([
+            lambda text: _review(text, findings),
+            lambda text: _review(text, []),
+        ], chapters=1)
+
+        chapter = self.root / "shorts" / "flow" / "ch0001.md"
+        artifact = self.root / "out" / "flow" / "chapter_acceptance" / "ch0001.json"
+        self.assertEqual(result, 0)
+        self.assertTrue(chapter.is_file())
+        self.assertEqual(chapter.read_text(encoding="utf-8"), REPAIRED_TEXT)
+        history = json.loads(artifact.read_text(encoding="utf-8"))["history"]
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["gate"]["decision"], "repair_required")
+        self.assertEqual(history[1]["gate"]["decision"], "passed")
+        self.assertEqual(self.store.rows[1]["status"], ChapterStatus.COMPLETED.value)
+        self.assertEqual(self.reviewed_names, ["ch0001.md", "ch0001.md"])
+
+    def test_unresolved_recheck_does_not_write_and_blocks_following_chapter(self):
+        findings = [{
+            "category": "clarity_idiomaticity", "reason": "wording is wrong",
+            "repair_scope": "sentence", "evidence_quotes": ["cited wrong"],
+        }]
+        result = self._run_flow([
+            lambda text: _review(text, findings),
+            lambda text: _review(text, [{
+                "category": "clarity_idiomaticity", "reason": "still wrong",
+                "repair_scope": "sentence", "evidence_quotes": ["cited fixed"],
+            }]),
+        ], chapters=2)
+
+        story_dir = self.root / "shorts" / "flow"
+        self.assertEqual(result, 2)
+        self.assertFalse((story_dir / "ch0001.md").exists())
+        self.assertFalse((story_dir / "ch0002.md").exists())
+        self.assertEqual(self.store.rows[1]["status"], ChapterStatus.FAILED.value)
+        self.assertEqual(self.store.rows[2]["status"], ChapterStatus.BLOCKED.value)
+        self.assertEqual(self.reviewed_names, ["ch0001.md", "ch0001.md"])
+
+
+if __name__ == "__main__":
+    unittest.main()

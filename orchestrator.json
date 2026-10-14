@@ -14,6 +14,27 @@
     "native_min": 4,
     "engagement_min": 3
   },
+  "chapter_acceptance": {
+    "enabled": true,
+    "max_repair_rounds": 2
+  },
+  "final_editor": {
+    "enabled": true,
+    "timeout_seconds": 7200,
+    "unresolved_remediation_rounds": 2,
+    "dossier_role": "final_editor",
+    "plan_role": "final_editor",
+    "editor_role": "final_editor",
+    "review_role": "final_editor"
+  },
+  "radar": {
+    "sources": "inkitt_browser,inkitt_browser_validation,amazon",
+    "list": 20,
+    "no_chapters": true,
+    "recommend_count": 4,
+    "portfolio": "weighted",
+    "category_mode": "separate_validation"
+  },
   "notify": {
     "enabled": false,
     "channel": "desktop"

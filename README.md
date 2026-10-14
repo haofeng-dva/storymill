@@ -5,7 +5,7 @@
 ## 系统架构
 
 ```
-radar.py            选品：抓 RoyalRoad 榜单 → 空位量化 → 推荐入库
+radar.py            选品：女性向多源榜单（默认 Wattpad/Inkitt/WebNovel/Amazon；Royal Road 可选）→ 跨平台信号 → 推荐入库
 direction_manager   方向：采纳推荐 → 生成方向文件
 engine.py           写作：方向 → 大纲 → world bible → 分章(字数硬校验) → 中文摘要
 native_check.py     质检：Gemini 母语级审稿(地道+精彩双维度) + 搭配检查
@@ -37,15 +37,25 @@ GEMINI_API_KEY / GEMINI_MODEL / GEMINI_PROXY                # Gemini母语级审
 
 ```powershell
 py -3 orchestrator.py --cycle     # 雷达选品→采纳→写作→质检→包装，全自动
+py -3 orchestrator.py --recommend # 只抓取并自动生成推荐，不写文章
 ```
 
 ### 分步手动跑
 
 ```powershell
-py -3 radar.py                              # 1. 选品
+py -3 radar.py                              # 1. 选品（默认不含 Royal Road）
+set RADAR_SOURCES=wattpad,inkitt,webnovel,amazon
+py -3 radar.py --sources %RADAR_SOURCES%  # 女性向多源选品（站点不可用时单源失败隔离）
+# Inkitt 若返回 Cloudflare Turnstile，雷达会标记为 error；只有用户自己的授权会话才可通过 INKITT_COOKIE 提供 Cookie
+
+# Inkitt 浏览器桥接（扩展安装一次；雷达会自动启动本地桥接，不需每次手动开 Python 服务）
+# 主雷达请在 Inkitt 首页/广泛发现页运行；主题页只用于子赛道验证，不用于整体份额
+py -3 radar.py --sources inkitt_browser,wattpad,amazon --no-chapters
 py -3 direction_manager.py list             # 2. 看推荐
 py -3 direction_manager.py adopt            # 3. 采纳 top1
-py -3 engine.py --direction-file directions\rec_N.txt --story-id my_story --quality-gate   # 4. 写作(质量门槛)
+py -3 engine.py --direction-file directions\rec_N.txt --story-id my_story   # 4. 写作（每章默认强制验收、修复、复查）
+# 12 章只是试写批次；审核通过后从已有末章继续追加，例如再写 12 章
+py -3 engine.py --story-id my_story --append-chapters 12   # 追加章同样强制走章节验收
 py -3 native_check.py --story-id my_story --sample 3   # 5. 质检(抽样)
 py -3 packager.py --story-id my_story       # 6. 包装
 ```
