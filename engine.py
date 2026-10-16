@@ -37,8 +37,16 @@ from chapter_tasks import ChapterTaskStore
 from writing_status import write_status
 from book_memory import BookMemory
 from repair_validator import apply_scoped_patches, local_validate
+from chapter_contract import (
+    ARTIFACT_NAME, ChapterContractError, parse_compiler_response,
+    planning_hash as chapter_contract_planning_hash, requirements_for_chapter,
+    writer_contract_block,
+)
 from control_context import build_control_context, load_state_delta
-from control_contracts import ControlContractError, load_control_bundle, sha256_text, source_hash
+from control_contracts import (
+    ControlContractError, acceptance_requirements_for_chapter, load_control_bundle,
+    sha256_text, source_hash,
+)
 from control_runtime import ControlledGenerationRuntime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -91,6 +99,8 @@ def build_argument_parser():
                     help="在已有故事末尾追加章节；12章只是试写批次，不代表全书结束")
     ap.add_argument("--controlled-generation", action="store_true",
                     help="启用章节合同/场景账本控制（默认关闭）")
+    ap.add_argument("--chapter-contracts", action="store_true",
+                    help="试用：将每章大纲编译为冻结的原子合同，供正文与验收共用")
     ap.add_argument("--control-dir", default="", help="控制产物目录（默认故事目录/control）")
     ap.add_argument("--control-dry-run", action="store_true",
                     help="仅校验受控生成输入和每章上下文，不调用正文模型")
@@ -98,6 +108,13 @@ def build_argument_parser():
     ap.add_argument("--control-repair-card", default="", help="预留：仅处理指定控制失败卡")
     ap.add_argument("--assemble-only", action="store_true", help="仅从已完成章节重建 full.md，不调用模型")
     return ap
+
+
+def option_compatibility_error(args):
+    """Reject modes that would define competing chapter completion contracts."""
+    if args.controlled_generation and args.chapter_contracts:
+        return "--chapter-contracts cannot be combined with --controlled-generation; controlled end_assertions are the acceptance contract"
+    return None
 
 
 def should_reuse_planning_artifact(args, path):
@@ -202,6 +219,11 @@ class LLM:
         self.relay_base = os.environ.get("OPENAI_RELAY_BASE", "")
         self.relay_key = os.environ.get("OPENAI_RELAY_KEY", "")
         self.relay_config = cfg["llm"].get("relay", {})
+        # Ark can leave a socket half-open past urllib's nominal timeout. Keep
+        # every Ark-backed step bounded so a serial chapter run can fail closed.
+        self.ark_request_timeout_seconds = max(
+            1, int(cfg["llm"].get("ark_request_timeout_seconds", 90))
+        )
         self.run_id = ""
         self.story_id = ""
         self.chapter_no = None
@@ -265,11 +287,35 @@ class LLM:
             },
         )
         t0 = time.time()
-        try:
-            with urllib.request.urlopen(req, timeout=300) as r:
-                data = json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            return {"error": f"HTTP {e.code}: {e.read().decode('utf-8', 'ignore')[:400]}"}
+        result = {}
+
+        def worker():
+            try:
+                with urllib.request.urlopen(
+                    req, timeout=self.ark_request_timeout_seconds
+                ) as response:
+                    result["data"] = json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                result["error"] = (
+                    f"HTTP {exc.code}: "
+                    f"{exc.read().decode('utf-8', 'ignore')[:400]}"
+                )
+            except Exception as exc:
+                result["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        thread.join(timeout=self.ark_request_timeout_seconds + 5)
+        if thread.is_alive():
+            return {"error": (
+                f"TimeoutError: Ark request exceeded "
+                f"{self.ark_request_timeout_seconds + 5}s"
+            )}
+        if "error" in result:
+            return {"error": result["error"]}
+        data = result.get("data")
+        if not isinstance(data, dict):
+            return {"error": "invalid Ark response"}
         msg = data["choices"][0]["message"]
         content = (msg.get("content") or "").strip()
         reasoning = (msg.get("reasoning_content") or "").strip()
@@ -428,10 +474,14 @@ class LLM:
                     data = json.loads(response.read().decode("utf-8"))
                 break
             except urllib.error.HTTPError as exc:
-                if exc.code in retry_codes and attempt < max_attempts - 1:
+                error_body = exc.read().decode("utf-8", "ignore")[:400]
+                # This relay intermittently returns a bare gateway page as a
+                # 404. Do not retry real API/model 404s such as model_not_found.
+                transient_gateway_404 = exc.code == 404 and error_body.strip().lower() == "404 page not found"
+                if (exc.code in retry_codes or transient_gateway_404) and attempt < max_attempts - 1:
                     time.sleep(retry_sleeps[attempt])
                     continue
-                return {"error": f"HTTP {exc.code}: {exc.read().decode('utf-8', 'ignore')[:400]}"}
+                return {"error": f"HTTP {exc.code}: {error_body}"}
             except Exception as exc:
                 if attempt < max_attempts - 1:
                     time.sleep(retry_sleeps[attempt])
@@ -723,6 +773,56 @@ class WritingEngine:
             "elapsed": round(core.get("elapsed", 0) + support.get("elapsed", 0), 1),
         }
 
+    def compile_chapter_contracts(self, direction, outline, world_bible, story_id, chapter_numbers):
+        """Compile only hard chapter obligations; prose taste stays outside the contract."""
+        source_sha256 = chapter_contract_planning_hash(direction, outline, world_bible)
+        schema = {
+            "schema_version": "chapter_acceptance_contract_v1",
+            "story_id": story_id,
+            "source_sha256": source_sha256,
+            "chapters": {
+                "0001": {
+                    "chapter": 1,
+                    "requirements": [{
+                        "id": "ch0001-contract-01",
+                        "type": "event|fact|dialogue|context|recognition",
+                        "requirement": "one atomic, literal chapter obligation",
+                        "source_quote": "exact contiguous wording copied from the outline",
+                    }],
+                },
+            },
+        }
+        response = self.llm.chat("outline", [
+            {"role": "system", "content": (
+                "You compile fiction planning into a strict production contract. "
+                "Return JSON only. Do not invent facts or add prose advice."
+            )},
+            {"role": "user", "content": (
+                "Build one frozen atomic contract for each requested chapter. "
+                "Use 2-6 requirements per chapter. Include only plot outcomes that must be explicit in the prose: "
+                "events, concrete facts, required dialogue, time/place context, or a character's explicit recognition. "
+                "Each requirement must test one thing; split compound beats. Exclude mood, quality, style, pacing, "
+                "and optional description. IDs must be sequential exactly as shown in the schema.\n\n"
+                "Every source_quote must be an exact contiguous quote copied from the supplied outline that supports the item.\n\n"
+                "Requested chapters: " + json.dumps(list(chapter_numbers)) + "\n\n"
+                "Story direction:\n" + direction + "\n\n"
+                "Outline:\n" + outline + "\n\n"
+                "World bible:\n" + world_bible + "\n\n"
+                "Return exactly this JSON shape, using the real requested chapter keys and no extra keys:\n"
+                + json.dumps(schema, ensure_ascii=False)
+            )},
+        ], max_tokens=2400, temperature=0.1, json_mode=True)
+        if "error" in response:
+            return response
+        try:
+            document = parse_compiler_response(
+                response.get("content"), story_id, chapter_numbers, source_sha256,
+                outline,
+            )
+        except ChapterContractError as exc:
+            return {"error": str(exc)}
+        return {"content": document, "source_sha256": source_sha256}
+
     def _minimal_user(self, direction, outline, world_bible, chapter_n, total, target_words, word_feedback, extra_rules=""):
         """精简包：thinking 强模型用。只给方向+大纲+字数，加两条极简关键约束（禁 on-the-nose 隐喻 + 禁背景堆砌）。
         交接卡/lessons 等额外规则拼接在末尾，保证衔接信息不丢。"""
@@ -784,6 +884,8 @@ class WritingEngine:
         seg_words = int(self.w.get("segment_words", 500))
         seg_words = max(150, min(seg_words, 900))
         segment_cooldown = max(0, float(self.w.get("segment_cooldown", 1)))
+        segment_recovery_attempts = max(0, min(int(self.w.get("segment_recovery_attempts", 0)), 2))
+        segment_recovery_wait = max(0, float(self.w.get("segment_recovery_wait_seconds", 20)))
         n_segs = max(1, (target_words + seg_words - 1) // seg_words)
         bible = f"\n\nWorld bible (settings that MUST stay consistent):\n{world_bible}" if world_bible else ""
         base = (
@@ -804,12 +906,20 @@ class WritingEngine:
                 user = base + f"Write the opening ~{current_seg_words} words of this chapter. Output only prose."
             else:
                 user = base + f"Continue the chapter seamlessly, writing the next ~{current_seg_words} words. Output only prose.\n\nWritten so far:\n{full[-1500:]}"
-            r = self.llm.chat("writer", [
-                {"role": "system", "content": "You are a literary fiction writer. Write vivid, natural English prose."},
-                {"role": "user", "content": user},
-            ], max_tokens=2000, temperature=self.w["temperature"])
-            if "error" in r:
-                return r
+            for segment_attempt in range(segment_recovery_attempts + 1):
+                r = self.llm.chat("writer", [
+                    {"role": "system", "content": "You are a literary fiction writer. Write vivid, natural English prose."},
+                    {"role": "user", "content": user},
+                ], max_tokens=2000, temperature=self.w["temperature"])
+                if "error" not in r:
+                    break
+                if (
+                    classify_failure(r.get("error")) != FailureType.NETWORK.value
+                    or segment_attempt >= segment_recovery_attempts
+                ):
+                    return r
+                if segment_recovery_wait:
+                    _t.sleep(segment_recovery_wait)
             seg = r["content"].strip()
             full = (full + "\n\n" + seg).strip()
             if count_words(full) >= target_words:
@@ -1000,7 +1110,7 @@ class WritingEngine:
         return r
 
     def generate_state_delta(self, text, chapter_no, contract, scenes=()):
-        """Reuse the existing handoff call budget for an actual-state JSON record."""
+        """Use the structured reviewer route for an actual-state JSON record."""
         required = {
             "chapter": chapter_no,
             "source_sha256": sha256_text(text),
@@ -1012,10 +1122,10 @@ class WritingEngine:
                 "fact_slots": scene["fact_slots"],
             } for scene in scenes],
         }
-        # Controlled state is the one inter-chapter authority.  Use the same
-        # planning role as contract compilation, replacing rather than adding
-        # the ordinary cheap handoff call.
-        return self.llm.chat("outline", [
+        # Controlled state is the inter-chapter authority. Use its dedicated
+        # structured-extraction route, separate from literary acceptance and
+        # long-form outline generation.
+        return self.llm.chat("state_delta", [
             {"role": "system", "content": (
                 "You are a continuity editor. Report only what the supplied chapter explicitly establishes. "
                 "Return strict JSON only; do not repair, infer, or make prose recommendations."
@@ -1027,33 +1137,44 @@ class WritingEngine:
                 "non_regression_statuses is a list of assertion_id, status (preserved|violated|unclear), and an exact "
                 "chapter quotation as evidence. Evidence must be a literal contiguous substring copied from the chapter: do not add "
                 "quotation marks, alter punctuation, normalize apostrophes, or paraphrase narrative prose. Include one status for every supplied assertion ID. Copy the chapter and source hash "
-                "exactly from the control input. scene_statuses must contain every supplied scene_id using exactly {scene_id,status,occurrence_count,evidence}; status is completed|repeated|missing|unclear. Count every substantive replay of that scene in the chapter: only completed with occurrence_count 1 passes. fact_statuses must contain every supplied fact slot using exactly {fact_id,status,value,evidence}; never use fact_slot_id or any alternate key. Status is consistent|contradicted|unclear. Copy the supplied canonical value exactly when consistent; report contradicted if the chapter gives any competing value. new_information, relationship_changes, open_hooks, and conflicts_with_contract must each be JSON arrays of strings; use [] when none apply. "
+                "exactly from the control input. scene_statuses must contain every supplied scene_id using exactly {scene_id,status,occurrence_count,evidence}; status is completed|repeated|missing|unclear. Count every substantive replay of that scene in the chapter: only completed with occurrence_count 1 passes. fact_statuses must contain every supplied fact slot using exactly {fact_id,status,value,evidence}; never use fact_slot_id or any alternate key. Status is consistent|contradicted|unclear. Copy the supplied canonical value exactly when consistent; report contradicted if the chapter gives any competing value. Set new_information, relationship_changes, open_hooks, and conflicts_with_contract to [] exactly. Do not summarize the chapter in those fields. "
                 "\n\nControl input:\n"
                 + json.dumps(required, ensure_ascii=False)
                 + "\n\nChapter text:\n---\n" + text + "\n---"
             )},
-        ], max_tokens=800, temperature=0.1, json_mode=True)
+        # GLM returns reliable structured text through ordinary chat, whereas
+        # its Ark response_format mode can stall or return no content. The
+        # parser below still validates the complete JSON schema and evidence.
+        ], max_tokens=800, temperature=0.1, json_mode=False)
 
     def repair_chapter_with_verified_patches(self, text, acceptance):
         """Repair acceptance findings without letting a model rewrite other prose."""
-        missing_outcomes = [
-            outcome.get("id", "unknown")
-            for outcome in acceptance.get("outcomes", [])
-            if outcome.get("status") != "met"
+        repairable_outcomes = [
+            outcome for outcome in acceptance.get("outcomes", [])
+            if outcome.get("status") in {"missing", "unclear"}
         ]
-        if missing_outcomes:
-            return {
-                "error": "acceptance repair has no verified edit anchor for missing outcome(s): "
-                + ", ".join(missing_outcomes)
-            }
+        insertion_anchors = [
+            outcome.get("insertion_anchor") for outcome in repairable_outcomes
+            if isinstance(outcome.get("insertion_anchor"), str) and outcome["insertion_anchor"]
+        ]
+        if len(insertion_anchors) != len(repairable_outcomes):
+            return {"error": "acceptance repair has no verified insertion anchor for incomplete outcome(s): " + ", ".join(
+                outcome.get("id", "unknown") for outcome in repairable_outcomes
+                if not outcome.get("insertion_anchor")
+            )}
         findings = acceptance.get("findings", [])
         anchors = [
             quote for finding in findings
             for quote in finding.get("evidence_quotes", [])
             if isinstance(quote, str) and quote
         ]
-        if not anchors:
+        if not anchors and not insertion_anchors:
             return {"error": "acceptance repair has no verified finding anchors"}
+        repair_outcomes = [{
+            "id": outcome.get("id"), "requirement": outcome.get("requirement"),
+            "status": outcome.get("status"), "reason": outcome.get("reason"),
+            "evidence_quotes": outcome.get("evidence_quotes"), "insertion_anchor": outcome.get("insertion_anchor"),
+        } for outcome in repairable_outcomes]
         repair_request = [{
             "category": finding.get("category"),
             "repair_scope": finding.get("repair_scope"),
@@ -1063,25 +1184,32 @@ class WritingEngine:
         response = self.llm.chat("writer", [
             {"role": "system", "content": (
                 "You are a fiction copy editor. Return JSON only with exactly one key: patches. "
-                "patches is a non-empty array of {find,replace}. Every find must copy one supplied "
-                "evidence quote exactly, character for character. Do not include surrounding text, "
-                "new commentary, or a full chapter. Repair only the cited defect."
+                "patches is a non-empty array. Use {find,replace} only when find copies one supplied "
+                "finding anchor exactly, character for character. Use {insert_after,insert} only when "
+                "insert_after copies one supplied insertion anchor exactly; insert must be one short paragraph "
+                "of at most 120 English words. Do not include surrounding text, new commentary, or a full chapter. "
+                "Repair only the cited defect."
             )},
             {"role": "user", "content": (
-                "Verified acceptance findings:\n" + json.dumps(repair_request, ensure_ascii=False) +
+                "Incomplete required outcomes with verified insertion anchors:\n" + json.dumps(repair_outcomes, ensure_ascii=False) +
+                "\n\nVerified acceptance findings:\n" + json.dumps(repair_request, ensure_ascii=False) +
                 "\n\nAllowed exact anchors:\n" + json.dumps(anchors, ensure_ascii=False) +
+                "\n\nAllowed exact insertion anchors:\n" + json.dumps(insertion_anchors, ensure_ascii=False) +
                 "\n\nChapter text:\n---\n" + text + "\n---"
             )},
         ], max_tokens=1800, temperature=0.25, json_mode=True)
         if "error" in response:
             return response
         try:
-            payload = json.loads((response.get("content") or "").strip())
+            raw = re.sub(
+                r"^```(?:json)?\s*|\s*```$", "", (response.get("content") or "").strip(), flags=re.I,
+            )
+            payload = json.loads(raw)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             return {"error": f"acceptance patch response is not valid JSON: {exc}"}
         if not isinstance(payload, dict) or set(payload) != {"patches"}:
             return {"error": "acceptance patch response must contain only patches"}
-        applied = apply_scoped_patches(text, payload["patches"], anchors)
+        applied = apply_scoped_patches(text, payload["patches"], anchors, insertion_anchors)
         if not applied["accepted"]:
             return {"error": "acceptance repair scope rejected: " + "; ".join(applied["errors"]), "audit": applied["audit"]}
         return {"content": applied["text"], "audit": applied["audit"]}
@@ -1100,6 +1228,11 @@ def main():
             return 2
         print(f"full book -> {full_path}")
         return 0
+
+    option_error = option_compatibility_error(args)
+    if option_error:
+        print("OPTION ERROR:", option_error)
+        return 2
 
     # 解析方向：--direction-file 优先，否则 --direction
     if args.direction_file:
@@ -1295,6 +1428,26 @@ def main():
         print("[resume] all requested chapters are already completed; nothing to do")
         return 0
 
+    chapter_contract_document = None
+    if args.chapter_contracts:
+        if args.append_chapters:
+            print("CHAPTER CONTRACT ERROR: --chapter-contracts does not yet support --append-chapters")
+            task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), "append contracts unsupported")
+            return 2
+        print(f"[contract] compiling frozen requirements for {len(chapter_range)} chapter(s) ...")
+        compiled = engine.compile_chapter_contracts(
+            direction, outline_text, bible_text, args.story_id, chapter_range,
+        )
+        if "error" in compiled:
+            print("CHAPTER CONTRACT ERROR:", compiled["error"])
+            task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), compiled["error"])
+            return 2
+        chapter_contract_document = compiled["content"]
+        with open(os.path.join(out_dir, ARTIFACT_NAME), "w", encoding="utf-8") as handle:
+            json.dump(chapter_contract_document, handle, ensure_ascii=False, indent=2)
+        item_count = sum(len(requirements_for_chapter(chapter_contract_document, n)) for n in chapter_range)
+        print(f"    contract done ({item_count} atomic requirements)")
+
     for chapter_no in chapter_range:
         chapter_store.update(chapter_no, ChapterStatus.PENDING.value)
 
@@ -1306,7 +1459,7 @@ def main():
     chapter_requirements = {}
     if args.quality_gate:
         from native_check import (
-            QualityJudge, build_acceptance_reviewers,
+            QualityJudge, build_acceptance_reviewers, freeze_acceptance_issue_ledger,
             extract_chapter_requirements, review_chapter_acceptance,
         )
         judge = QualityJudge(os.environ)
@@ -1317,19 +1470,37 @@ def main():
         chapter_acceptance_enabled = bool(acceptance_cfg.get("enabled", True))
         chapter_acceptance_rounds = max(0, min(4, int(acceptance_cfg.get("max_repair_rounds", 2))))
         if chapter_acceptance_enabled:
-            chapter_acceptance_reviewers = build_acceptance_reviewers()
-            chapter_requirements = {
-                chapter_no: extract_chapter_requirements(outline_text, chapter_no)
-                for chapter_no in chapter_range
-            }
+            chapter_acceptance_reviewers = build_acceptance_reviewers(acceptance_cfg)
+            if control_bundle:
+                try:
+                    chapter_requirements = {
+                        chapter_no: acceptance_requirements_for_chapter(control_bundle, chapter_no)
+                        for chapter_no in chapter_range
+                    }
+                except ControlContractError as exc:
+                    print(f"CONTROL ERROR: {exc}")
+                    task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), str(exc))
+                    return 2
+            elif chapter_contract_document:
+                chapter_requirements = {
+                    chapter_no: requirements_for_chapter(chapter_contract_document, chapter_no)
+                    for chapter_no in chapter_range
+                }
+            else:
+                chapter_requirements = {
+                    chapter_no: extract_chapter_requirements(outline_text, chapter_no)
+                    for chapter_no in chapter_range
+                }
 
-    def _write_acceptance_artifact(chapter_no, history):
+    def _write_acceptance_artifact(chapter_no, history, issue_ledger=None):
         """Keep failed candidates out of the story directory but retain their audit trail."""
         target = os.path.join(HERE, "out", args.story_id, "chapter_acceptance", f"ch{chapter_no:04d}.json")
         os.makedirs(os.path.dirname(target), exist_ok=True)
+        artifact = {"story_id": args.story_id, "chapter": chapter_no, "history": history}
+        if issue_ledger is not None:
+            artifact["issue_ledger"] = issue_ledger
         with open(target, "w", encoding="utf-8") as handle:
-            json.dump({"story_id": args.story_id, "chapter": chapter_no, "history": history},
-                      handle, ensure_ascii=False, indent=2)
+            json.dump(artifact, handle, ensure_ascii=False, indent=2)
 
     # 块状并行块数：命令行 > config（默认 1 = 串行）
     requested_blocks = args.parallel_blocks
@@ -1410,6 +1581,8 @@ def main():
             if memory_block and not handoff_block:
                 memory_block = "\n\n" + memory_block
             extra = handoff_block + memory_block + args.extra_rules + lessons_block + quality_feedback
+            if chapter_contract_document:
+                extra += "\n\n" + writer_contract_block(chapter_contract_document, n)
             if control_bundle:
                 try:
                     controlled = control_runtime.context_for(n)
@@ -1528,6 +1701,7 @@ def main():
         acceptance = None
         if chapter_acceptance_enabled:
             acceptance_history = []
+            issue_ledger = None
             for acceptance_round in range(chapter_acceptance_rounds + 1):
                 local_blockers = quality_checks.strict_prose_violations(text)
                 words = count_words(text)
@@ -1535,19 +1709,32 @@ def main():
                     local_blockers.append(engine._word_feedback(
                         text, args.words, engine.w["word_min"], engine.w["word_max"]
                     ))
-                acceptance = review_chapter_acceptance(
-                    f"ch{n:04d}.md", text, chapter_requirements.get(n, []), chapter_acceptance_reviewers,
-                )
+                if issue_ledger is None:
+                    acceptance = review_chapter_acceptance(
+                        f"ch{n:04d}.md", text, chapter_requirements.get(n, []), chapter_acceptance_reviewers,
+                    )
+                else:
+                    acceptance = review_chapter_acceptance(
+                        f"ch{n:04d}.md", text, chapter_requirements.get(n, []), chapter_acceptance_reviewers,
+                        issue_ledger=issue_ledger,
+                    )
                 acceptance_gate = quality_gate.chapter_acceptance_decision(
-                    acceptance, text, local_blockers,
+                    acceptance, text, local_blockers, issue_ledger=issue_ledger,
                 )
+                ledger_frozen_this_round = False
+                if (chapter_contract_document or control_bundle) and issue_ledger is None and acceptance_gate["decision"] != "verification_failed":
+                    try:
+                        issue_ledger = freeze_acceptance_issue_ledger(n, acceptance)
+                        ledger_frozen_this_round = True
+                    except ValueError as exc:
+                        acceptance_gate = {"decision": "verification_failed", "blockers": [str(exc)]}
                 acceptance_history.append({
                     "attempt": acceptance_round + 1,
                     "candidate_sha256": sha256_text(text),
                     "review": acceptance,
                     "gate": acceptance_gate,
                 })
-                _write_acceptance_artifact(n, acceptance_history)
+                _write_acceptance_artifact(n, acceptance_history, issue_ledger)
                 if acceptance_gate["decision"] == "passed":
                     print(f"    ch{n} chapter acceptance passed on attempt {acceptance_round + 1}", flush=True)
                     break
@@ -1574,9 +1761,13 @@ def main():
                 engine.llm.set_call_context(
                     attempt=acceptance_round + 1, purpose="chapter_acceptance_repair", retry_index=acceptance_round,
                 )
-                repaired = engine.repair_chapter_with_verified_patches(text, acceptance)
+                repair_review = acceptance
+                if issue_ledger is not None and not ledger_frozen_this_round:
+                    repair_review = dict(acceptance)
+                    repair_review["findings"] = acceptance_gate["repair_findings"]
+                repaired = engine.repair_chapter_with_verified_patches(text, repair_review)
                 acceptance_history[-1]["repair"] = repaired.get("audit") or {"status": "rejected"}
-                _write_acceptance_artifact(n, acceptance_history)
+                _write_acceptance_artifact(n, acceptance_history, issue_ledger)
                 if "error" in repaired or not repaired.get("content", "").strip():
                     failure = repaired.get("error", "chapter acceptance repair returned empty text")
                     chapter_store.update(
@@ -1607,18 +1798,6 @@ def main():
                 return n, None
         q = f", quality={r.get('quality','?')}" if judge else ""
         print(f"    ch{n}: {r['words']} words, {r['elapsed']}s, rewrites={r['rewrites']}{q}, ai-tells={issues or 'clean'}, local={local_warnings or 'clean'}")
-        chap_file = os.path.join(out_dir, f"ch{n:04d}.md")
-        try:
-            open(chap_file, "w", encoding="utf-8").write(text)
-        except OSError as exc:
-            failure = f"{type(exc).__name__}: {exc}"
-            chapter_store.update(
-                n, ChapterStatus.FAILED.value, attempt=(r.get("rewrites", 0) + 1),
-                elapsed_s=round(time.time() - chapter_started, 1), error=failure,
-                failure_type=FailureType.FILE.value,
-            )
-            print(f"    CH{n} FILE ERROR: {failure}", flush=True)
-            return n, None
         state_ok = _handoff_for(text, n) if control_bundle else True
         previous_state = load_state_delta(control_dir, n - 1) if control_bundle and n > 1 else None
         current_state = quality_gate.load_state_evidence(
@@ -1643,6 +1822,18 @@ def main():
                 error=failure, failure_type=FailureType.QUALITY.value,
             )
             print(f"    CONTROL ERROR ch{n}: {failure}", flush=True)
+            return n, None
+        chap_file = os.path.join(out_dir, f"ch{n:04d}.md")
+        try:
+            open(chap_file, "w", encoding="utf-8").write(text)
+        except OSError as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+            chapter_store.update(
+                n, ChapterStatus.FAILED.value, attempt=(r.get("rewrites", 0) + 1),
+                elapsed_s=round(time.time() - chapter_started, 1), error=failure,
+                failure_type=FailureType.FILE.value,
+            )
+            print(f"    CH{n} FILE ERROR: {failure}", flush=True)
             return n, None
         chapter_store.update(
             n, ChapterStatus.COMPLETED.value, quality=r.get("quality"),

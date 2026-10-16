@@ -2,26 +2,58 @@
   "llm": {
     "base_url": "https://ark.cn-beijing.volces.com/api/v3",
     "api_key_env": "ARK_API_KEY",
+    "ark_request_timeout_seconds": 90,
     "models": {
-      "writer": "gpt-5.5",
-      "outline": "gpt-5.5",
+      "writer": "gpt-5.6-terra",
+      "outline": "gpt-5.6-terra",
+      "final_editor": "gpt-5.5",
       "reviewer": "glm-5-2-260617",
+      "state_delta": "glm-5-2-260617",
       "cn_summary": "deepseek-v4-flash-260425",
       "radar": "deepseek-v4-flash-260425",
       "handoff": "deepseek-v4-flash-260425"
     },
-    "note": "writer/outline 用 gpt-5.5（直连无需代理，母语级）；gemini-3.1-pro 需代理，代理开时可切回；reviewer 保留 glm（native_check 盲评已 GPT 优先）；大纲长输出走分段 write_outline_segmented 绕 504"
+    "relay": {
+      "wire_api": "responses",
+      "role_wire_apis": {
+        "writer": "chat_completions",
+        "outline": "chat_completions",
+        "final_editor": "chat_completions"
+      },
+      "writer_fallback": {
+        "model": "gpt-5.6-terra",
+        "primary_max_attempts": 3,
+        "primary_request_timeout_seconds": 150
+      },
+      "headers": {
+        "x-openai-actor-authorization": "local-image-extension"
+      }
+    },
+    "note": "writer/outline 用 gpt-5.6-terra；末尾 AI 检测与修复保留 gpt-5.5；reviewer 和 state_delta 用 glm；摘要、雷达用 DeepSeek。Terra 当前是中转可验证的生产路由。"
   },
   "writing": {
     "default_chapters": 12,
-    "default_words": 2000,
+    "default_words": 2500,
     "word_band": 0.1,
-    "max_rewrite": 3,
+    "max_rewrite": 2,
     "temperature": 0.85,
     "serial_mode": true,
-    "parallel_blocks": 1
+    "parallel_blocks": 2,
+    "segment_words": 500,
+    "segment_cooldown": 1,
+    "segment_recovery_attempts": 1,
+    "segment_recovery_wait_seconds": 20,
+    "recovery_rounds": 3,
+    "recovery_wait_seconds": 90,
+    "experience_runtime": {
+      "enabled": true,
+      "pack": "distill/sandbox_experience_pack.json",
+      "max_items": 2
+    }
   },
   "genre_keywords": {
+    "lgbt_romance": ["lgbtq+", "lgbt", "queer romance", "bisexual romance", "same-sex romance"],
+    "dark_romance": ["dark romance", "dark adult romance"],
     "domestic_suspense": ["suspense", "thriller", "crime", "mystery", "noir", "forensic", "murder"],
     "webfiction": ["fantasy", "litrpg", "progression", "isekai", "romantasy", "cultivation", "time loop", "system", "dungeon"],
     "literary": ["literary", "contemporary", "family drama", "coming of age"]

@@ -1,23 +1,125 @@
+import json
 import unittest
 import hashlib
 from unittest.mock import patch
 
 from native_check import (
+    acceptance_review_with_fallback,
+    build_acceptance_reviewers,
     acceptance_repair_feedback,
     blocking_review_findings,
     editorial_review_findings,
     extract_chapter_requirements,
+    freeze_acceptance_issue_ledger,
     merge_retry_results,
     normalize_review_coverage,
     parse_acceptance_review,
     parse_scores,
     request_json_bounded,
+    review_chapter_acceptance,
     review_texts_with_retries,
     retryable_report_files,
 )
 
 
 class NativeCheckParsingTests(unittest.TestCase):
+    def test_acceptance_uses_next_reviewer_when_first_output_fails_schema_validation(self):
+        class InvalidQuoteReviewer:
+            model = "first-model"
+            acceptance_attempts = 1
+            acceptance_max_tokens = 700
+            acceptance_timeout_seconds = 45
+
+            def _call(self, *_args, **_kwargs):
+                return {"content": json.dumps({
+                    "outcomes": [{
+                        "id": "ch0001-contract-01", "status": "met",
+                        "evidence_quotes": ['"Mara found the ledger."'],
+                        "insertion_anchor": None, "reason": "shown",
+                    }],
+                    "findings": [],
+                })}
+
+        class ValidReviewer(InvalidQuoteReviewer):
+            model = "second-model"
+
+            def _call(self, *_args, **_kwargs):
+                return {"content": json.dumps({
+                    "outcomes": [{
+                        "id": "ch0001-contract-01", "status": "met",
+                        "evidence_quotes": ["Mara found the ledger."],
+                        "insertion_anchor": None, "reason": "shown",
+                    }],
+                    "findings": [],
+                })}
+
+        result = review_chapter_acceptance(
+            "ch0001.md", "Mara found the ledger.",
+            [{"id": "ch0001-contract-01", "requirement": "Mara finds the ledger."}],
+            [("first", InvalidQuoteReviewer()), ("second", ValidReviewer())],
+        )
+
+        self.assertNotIn("error", result)
+        self.assertEqual(result["provider"], "second-model (second)")
+
+    def test_acceptance_can_route_gpt_review_to_a_separate_model(self):
+        cfg = {"llm": {
+            "base_url": "https://ark.example",
+            "api_key_env": "ARK_API_KEY",
+            "models": {"reviewer": "glm-test"},
+            "relay": {"headers": {}, "writer_fallback": {"model": "gpt-5.6-sol"}},
+        }}
+        env = {"OPENAI_RELAY_BASE": "https://relay.example", "OPENAI_RELAY_KEY": "key"}
+        with patch("native_check.load_env", return_value=env), \
+             patch("native_check.load_json", return_value=cfg):
+            reviewers = build_acceptance_reviewers({
+                "gpt_model": "gpt-5.6-terra",
+                "gpt_primary_attempts": 1,
+                "gpt_fallback_model": "gpt-5.6-sol",
+                "gpt_fallback_attempts": 1,
+                "gpt_max_output_tokens": 1400,
+                "gpt_request_timeout_seconds": 150,
+                "glm_max_output_tokens": 700,
+                "glm_attempts": 2,
+                "glm_request_timeout_seconds": 90,
+            })
+
+        gpt = dict(reviewers)["gpt"]
+        glm = dict(reviewers)["glm"]
+        self.assertEqual(reviewers[0][0], "glm")
+        self.assertEqual(gpt.model, "gpt-5.6-terra")
+        self.assertEqual(gpt.primary_attempts, 1)
+        self.assertEqual(gpt.fallback_model, "gpt-5.6-sol")
+        self.assertEqual(gpt.fallback_attempts, 1)
+        self.assertEqual(gpt.acceptance_max_tokens, 1400)
+        self.assertEqual(gpt.acceptance_timeout_seconds, 150)
+        self.assertEqual(glm.acceptance_max_tokens, 700)
+        self.assertEqual(glm.acceptance_attempts, 2)
+        self.assertEqual(glm.acceptance_timeout_seconds, 90)
+
+    def test_acceptance_retries_only_a_failed_glm_attempt_before_fallback(self):
+        class FlakyReviewer:
+            model = "glm-test"
+            acceptance_attempts = 2
+            acceptance_max_tokens = 700
+            acceptance_timeout_seconds = 90
+
+            def __init__(self):
+                self.calls = 0
+
+            def _call(self, *_args, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return {"error": "transient timeout"}
+                return {"content": "{\"outcomes\": [], \"findings\": []}"}
+
+        reviewer = FlakyReviewer()
+        content, provider = acceptance_review_with_fallback("Chapter.", [], [("glm", reviewer)])
+
+        self.assertEqual(reviewer.calls, 2)
+        self.assertEqual(content, "{\"outcomes\": [], \"findings\": []}")
+        self.assertEqual(provider, "glm-test (glm)")
+
     def test_extracts_numbered_chapter_requirements_without_inventing_them(self):
         outline = """Chapter 1\n1. Mara finds the ledger.\n2. June refuses to leave.\n\nChapter 2\nMara loses the key."""
         requirements = extract_chapter_requirements(outline, 1)
@@ -86,8 +188,8 @@ Chapter 2: The Confrontation"""
         ]
         review = """{
           "outcomes": [
-            {"id": "ch0001-requirement-01", "status": "met", "evidence_quotes": ["Mara found the ledger."], "reason": "shown"},
-            {"id": "ch0001-requirement-02", "status": "met", "evidence_quotes": ["June refused to leave."], "reason": "shown"}
+            {"id": "ch0001-requirement-01", "status": "met", "evidence_quotes": ["Mara found the ledger."], "insertion_anchor": null, "reason": "shown"},
+            {"id": "ch0001-requirement-02", "status": "met", "evidence_quotes": ["June refused to leave."], "insertion_anchor": null, "reason": "shown"}
           ],
           "findings": []
         }"""
@@ -99,8 +201,48 @@ Chapter 2: The Confrontation"""
         text = "Mara found the ledger. Mara found the ledger again."
         requirements = [{"id": "ch0001-requirement-01", "requirement": "Mara finds the ledger."}]
         review = """{
-          "outcomes": [{"id": "ch0001-requirement-01", "status": "met", "evidence_quotes": ["Mara found the ledger."], "reason": "shown"}],
+          "outcomes": [{"id": "ch0001-requirement-01", "status": "met", "evidence_quotes": ["Mara found the ledger."], "insertion_anchor": null, "reason": "shown"}],
           "findings": [{"category": "duplicate_scene", "evidence_quotes": ["Mara found the ledger."], "reason": "repeated", "repair_scope": "scene"}]
+        }"""
+        self.assertIn("error", parse_acceptance_review(review, text, requirements))
+
+    def test_acceptance_review_accepts_missing_outcome_with_unique_paragraph_anchor(self):
+        text = "Mara enters the office.\n\nShe opens the tax box."
+        requirements = [{"id": "ch0001-requirement-01", "requirement": "Mara catalogues the bills."}]
+        review = """{
+          "outcomes": [{"id": "ch0001-requirement-01", "status": "missing", "evidence_quotes": [], "insertion_anchor": "Mara enters the office.", "reason": "The bills are never catalogued."}],
+          "findings": []
+        }"""
+        parsed = parse_acceptance_review(review, text, requirements)
+        self.assertNotIn("error", parsed)
+        self.assertEqual(parsed["outcomes"][0]["insertion_anchor"], "Mara enters the office.")
+
+    def test_acceptance_review_rejects_missing_outcome_without_unique_paragraph_anchor(self):
+        text = "Mara enters the office. Mara enters the office."
+        requirements = [{"id": "ch0001-requirement-01", "requirement": "Mara catalogues the bills."}]
+        review = """{
+          "outcomes": [{"id": "ch0001-requirement-01", "status": "missing", "evidence_quotes": [], "insertion_anchor": "Mara enters the office.", "reason": "The bills are never catalogued."}],
+          "findings": []
+        }"""
+        self.assertIn("error", parse_acceptance_review(review, text, requirements))
+
+    def test_acceptance_review_accepts_unclear_outcome_with_evidence_and_insertion_anchor(self):
+        text = "Mara sorts the files.\n\nDinner waits downstairs."
+        requirements = [{"id": "ch0001-requirement-01", "requirement": "Mara catalogues the bills before Sunday dinner."}]
+        review = """{
+          "outcomes": [{"id": "ch0001-requirement-01", "status": "unclear", "evidence_quotes": ["Mara sorts the files."], "insertion_anchor": "Mara sorts the files.", "reason": "The files are sorted, but bills and Sunday dinner are not explicit."}],
+          "findings": []
+        }"""
+        parsed = parse_acceptance_review(review, text, requirements)
+        self.assertNotIn("error", parsed)
+        self.assertEqual(parsed["outcomes"][0]["insertion_anchor"], "Mara sorts the files.")
+
+    def test_acceptance_review_rejects_unclear_outcome_without_evidence_or_anchor(self):
+        text = "Mara sorts the files.\n\nDinner waits downstairs."
+        requirements = [{"id": "ch0001-requirement-01", "requirement": "Mara catalogues the bills before Sunday dinner."}]
+        review = """{
+          "outcomes": [{"id": "ch0001-requirement-01", "status": "unclear", "evidence_quotes": [], "insertion_anchor": null, "reason": "The outcome is uncertain."}],
+          "findings": []
         }"""
         self.assertIn("error", parse_acceptance_review(review, text, requirements))
 
@@ -114,6 +256,46 @@ Chapter 2: The Confrontation"""
         })
         self.assertIn("Mara leaves town.", feedback)
         self.assertIn("Her pulse turned blunt.", feedback)
+
+    def test_frozen_issue_ledger_requires_every_initial_item_on_recheck(self):
+        initial_text = "Mara found the ledger twice."
+        ledger = freeze_acceptance_issue_ledger(1, {
+            "source_sha256": hashlib.sha256(initial_text.encode("utf-8")).hexdigest(),
+            "findings": [{
+                "category": "clarity_idiomaticity", "evidence_quotes": [initial_text],
+                "reason": "The sentence repeats.", "repair_scope": "sentence",
+            }],
+        })
+        self.assertEqual(ledger["items"][0]["id"], "ch0001-ledger-01")
+        text = "Mara found the ledger."
+        requirements = [{"id": "ch0001-requirement-01", "requirement": "Mara finds the ledger."}]
+        incomplete = """{
+          "outcomes": [{"id": "ch0001-requirement-01", "status": "met", "evidence_quotes": ["Mara found the ledger."], "insertion_anchor": null, "reason": "shown"}],
+          "findings": [],
+          "ledger_assessment": []
+        }"""
+        self.assertIn("error", parse_acceptance_review(incomplete, text, requirements, ledger))
+
+    def test_recheck_keeps_new_editorial_finding_separate_from_frozen_ledger(self):
+        initial_text = "Mara found the ledger twice."
+        ledger = freeze_acceptance_issue_ledger(1, {
+            "source_sha256": hashlib.sha256(initial_text.encode("utf-8")).hexdigest(),
+            "findings": [{
+                "category": "clarity_idiomaticity", "evidence_quotes": [initial_text],
+                "reason": "The sentence repeats.", "repair_scope": "sentence",
+            }],
+        })
+        text = "Mara found the ledger. Her pulse turned blunt."
+        requirements = [{"id": "ch0001-requirement-01", "requirement": "Mara finds the ledger."}]
+        recheck = """{
+          "outcomes": [{"id": "ch0001-requirement-01", "status": "met", "evidence_quotes": ["Mara found the ledger."], "insertion_anchor": null, "reason": "shown"}],
+          "findings": [{"category": "clarity_idiomaticity", "evidence_quotes": ["Her pulse turned blunt."], "reason": "New wording concern.", "repair_scope": "sentence"}],
+          "ledger_assessment": [{"id": "ch0001-ledger-01", "status": "resolved", "evidence_quotes": [], "reason": "The duplicate wording is gone."}]
+        }"""
+        parsed = parse_acceptance_review(recheck, text, requirements, ledger)
+        self.assertNotIn("error", parsed)
+        self.assertEqual(parsed["ledger_assessment"][0]["status"], "resolved")
+        self.assertEqual(parsed["findings"][0]["reason"], "New wording concern.")
 
     def test_bounded_request_preserves_a_successful_json_response(self):
         class Response:

@@ -27,6 +27,33 @@ class QualityGateTests(unittest.TestCase):
         self.assertEqual(decision["decision"], "repair_required")
         self.assertIn("duplicate_scene: same reveal twice", decision["blockers"])
 
+    def test_recheck_blocks_new_verified_finding_even_when_initial_issue_is_resolved(self):
+        ledger = {
+            "items": [{
+                "id": "ch0001-ledger-01", "category": "clarity_idiomaticity",
+                "repair_scope": "sentence", "reason": "original wording issue",
+                "evidence_quotes": ["old wording"],
+            }],
+        }
+        text = "Mara found the ledger."
+        review = {
+            "source_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "outcomes": [{"id": "ch0001-contract-01", "status": "met"}],
+            "findings": [{
+                "category": "abstract_template", "reason": "new observation",
+                "repair_scope": "sentence", "evidence_quotes": [text],
+            }],
+            "ledger_assessment": [{
+                "id": "ch0001-ledger-01", "status": "resolved", "reason": "fixed",
+                "evidence_quotes": [],
+            }],
+        }
+        decision = quality_gate.chapter_acceptance_decision(review, text, issue_ledger=ledger)
+        self.assertEqual(decision["decision"], "repair_required")
+        self.assertEqual(decision["repair_findings"], review["findings"])
+        self.assertIn("abstract_template: new observation", decision["blockers"])
+        self.assertEqual(decision["observations"], [])
+
     def test_chapter_acceptance_fails_closed_on_source_hash_mismatch(self):
         review = {"source_sha256": "0" * 64, "outcomes": [], "findings": []}
         decision = quality_gate.chapter_acceptance_decision(review, "Mara waits.")

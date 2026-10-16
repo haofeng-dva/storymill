@@ -27,65 +27,125 @@ def _unique_offset(text, excerpt):
     return first
 
 
-def apply_scoped_patches(before, patches, allowed_anchors):
-    """Apply only non-overlapping replacements anchored to verified source text.
+def _is_complete_paragraph(text, start, end):
+    """Require insertion anchors to name one whole source paragraph."""
+    before, after = text[:start], text[end:]
+    return (
+        (not before or re.search(r"\n\s*\n\s*$", before) is not None)
+        and (not after or re.match(r"^\s*\n\s*\n", after) is not None)
+    )
+
+
+def apply_scoped_patches(before, patches, allowed_anchors, insertion_anchors=()):
+    """Apply only verified replacements or small inserts at verified paragraphs.
 
     The model never chooses a free-form edit range: every ``find`` must be one
-    of the exact reviewer quotations and occur exactly once in the source.
+    of the exact reviewer quotations. An ``insert_after`` must be a unique
+    whole paragraph provided by the acceptance reviewer for a missing outcome.
     Invalid proposals return the untouched source so callers can fail closed.
     """
     audit = {
         "before_sha256": hashlib.sha256((before or "").encode("utf-8")).hexdigest(),
         "allowed_anchors": list(allowed_anchors or []),
+        "insertion_anchors": list(insertion_anchors or []),
         "patches": [],
     }
     if not isinstance(patches, list) or not patches:
         return {"accepted": False, "text": before, "audit": audit, "errors": ["repair returned no patches"]}
     anchors = {anchor for anchor in (allowed_anchors or []) if isinstance(anchor, str) and anchor}
-    if not anchors:
+    insert_anchors = {anchor for anchor in (insertion_anchors or []) if isinstance(anchor, str) and anchor}
+    if not anchors and not insert_anchors:
         return {"accepted": False, "text": before, "audit": audit, "errors": ["repair has no verified anchors"]}
 
-    spans = []
+    replacements = []
+    insertions = []
+    used_insertion_anchors = set()
     errors = []
     for index, patch in enumerate(patches, start=1):
-        if not isinstance(patch, dict) or set(patch) != {"find", "replace"}:
+        if not isinstance(patch, dict):
             errors.append(f"patch {index} has an invalid shape")
             continue
-        find, replace = patch["find"], patch["replace"]
-        if not isinstance(find, str) or not find or not isinstance(replace, str):
-            errors.append(f"patch {index} has invalid text")
+        if set(patch) == {"find", "replace"}:
+            find, replace = patch["find"], patch["replace"]
+            if not isinstance(find, str) or not find or not isinstance(replace, str):
+                errors.append(f"patch {index} has invalid text")
+                continue
+            if find not in anchors:
+                errors.append(f"patch {index} is outside verified repair anchors")
+                continue
+            start = _unique_offset(before, find)
+            if start is None:
+                errors.append(f"patch {index} anchor is not uniquely locatable")
+                continue
+            if find == replace:
+                errors.append(f"patch {index} makes no change")
+                continue
+            find_words = len(re.findall(r"[A-Za-z']+", find))
+            replace_words = len(re.findall(r"[A-Za-z']+", replace))
+            if replace_words > max(120, find_words * 8):
+                errors.append(f"patch {index} exceeds its verified repair scope")
+                continue
+            replacements.append((start, start + len(find), find, replace, index))
             continue
-        if find not in anchors:
-            errors.append(f"patch {index} is outside verified repair anchors")
+        if set(patch) == {"insert_after", "insert"}:
+            anchor, insert = patch["insert_after"], patch["insert"]
+            if not isinstance(anchor, str) or not anchor or not isinstance(insert, str) or not insert.strip():
+                errors.append(f"patch {index} has invalid insertion text")
+                continue
+            if anchor not in insert_anchors:
+                errors.append(f"patch {index} is outside verified insertion anchors")
+                continue
+            if anchor in used_insertion_anchors:
+                errors.append(f"patch {index} repeats a verified insertion anchor")
+                continue
+            start = _unique_offset(before, anchor)
+            if start is None:
+                errors.append(f"patch {index} insertion anchor is not uniquely locatable")
+                continue
+            if not _is_complete_paragraph(before, start, start + len(anchor)):
+                errors.append(f"patch {index} insertion anchor is not a complete paragraph")
+                continue
+            insert = insert.strip()
+            if re.search(r"\n\s*\n", insert) or len(re.findall(r"[A-Za-z']+", insert)) > 120:
+                errors.append(f"patch {index} exceeds its verified insertion scope")
+                continue
+            used_insertion_anchors.add(anchor)
+            insertions.append((start + len(anchor), anchor, insert, index))
             continue
-        start = _unique_offset(before, find)
-        if start is None:
-            errors.append(f"patch {index} anchor is not uniquely locatable")
-            continue
-        if find == replace:
-            errors.append(f"patch {index} makes no change")
-            continue
-        find_words = len(re.findall(r"[A-Za-z']+", find))
-        replace_words = len(re.findall(r"[A-Za-z']+", replace))
-        if replace_words > max(120, find_words * 8):
-            errors.append(f"patch {index} exceeds its verified repair scope")
-            continue
-        spans.append((start, start + len(find), find, replace, index))
+        errors.append(f"patch {index} has an invalid shape")
 
     if errors:
         return {"accepted": False, "text": before, "audit": audit, "errors": errors}
-    spans.sort()
-    for previous, current in zip(spans, spans[1:]):
+    replacements.sort()
+    for previous, current in zip(replacements, replacements[1:]):
         if current[0] < previous[1]:
             return {
                 "accepted": False, "text": before, "audit": audit,
                 "errors": [f"patch {current[4]} overlaps patch {previous[4]}"],
             }
+    for position, _anchor, _insert, index in insertions:
+        for start, end, _find, _replace, replacement_index in replacements:
+            if start <= position <= end:
+                return {
+                    "accepted": False, "text": before, "audit": audit,
+                    "errors": [f"patch {index} conflicts with patch {replacement_index}"],
+                }
 
     after = before
-    for start, end, find, replace, index in reversed(spans):
-        after = after[:start] + replace + after[end:]
-        audit["patches"].append({"index": index, "find": find, "replace": replace})
+    operations = [
+        (start, "replace", end, find, replace, index)
+        for start, end, find, replace, index in replacements
+    ] + [
+        (position, "insert", None, anchor, insert, index)
+        for position, anchor, insert, index in insertions
+    ]
+    for position, kind, end, anchor, value, index in sorted(operations, reverse=True):
+        if kind == "replace":
+            after = after[:position] + value + after[end:]
+            audit["patches"].append({"index": index, "find": anchor, "replace": value})
+        else:
+            after = after[:position] + "\n\n" + value + after[position:]
+            audit["patches"].append({"index": index, "insert_after": anchor, "insert": value})
     audit["patches"].reverse()
     audit["after_sha256"] = hashlib.sha256(after.encode("utf-8")).hexdigest()
     validation_errors = local_validate(before, after)

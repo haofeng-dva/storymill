@@ -16,7 +16,16 @@
   },
   "chapter_acceptance": {
     "enabled": true,
-    "max_repair_rounds": 2
+    "max_repair_rounds": 2,
+    "gpt_model": "gpt-5.6-terra",
+    "gpt_primary_attempts": 1,
+    "gpt_fallback_model": "gpt-5.6-sol",
+    "gpt_fallback_attempts": 1,
+    "gpt_max_output_tokens": 1400,
+    "gpt_request_timeout_seconds": 150,
+    "glm_max_output_tokens": 700,
+    "glm_attempts": 2,
+    "glm_request_timeout_seconds": 90
   },
   "final_editor": {
     "enabled": true,

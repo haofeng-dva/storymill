@@ -80,6 +80,118 @@ class StrictLocalRepairTests(unittest.TestCase):
         self.assertEqual(result["text"], before)
         self.assertIn("exceeds its verified repair scope", result["errors"][0])
 
+    def test_acceptance_patches_insert_only_after_verified_complete_paragraph(self):
+        before = "Mara enters the office.\n\nShe opens the tax box."
+        result = apply_scoped_patches(
+            before,
+            [{"insert_after": "Mara enters the office.", "insert": "She catalogued the unopened bills by date."}],
+            [],
+            ["Mara enters the office."],
+        )
+        self.assertTrue(result["accepted"])
+        self.assertEqual(
+            result["text"],
+            "Mara enters the office.\n\nShe catalogued the unopened bills by date.\n\nShe opens the tax box.",
+        )
+
+    def test_acceptance_patches_reject_unverified_insertion_anchor(self):
+        before = "Mara enters the office.\n\nShe opens the tax box."
+        result = apply_scoped_patches(
+            before,
+            [{"insert_after": "She opens the tax box.", "insert": "She catalogued the unopened bills by date."}],
+            [],
+            ["Mara enters the office."],
+        )
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["text"], before)
+        self.assertIn("outside verified insertion anchors", result["errors"][0])
+
+    def test_acceptance_patches_reject_repeated_insertion_anchor(self):
+        before = "Mara enters the office.\n\nShe opens the tax box."
+        result = apply_scoped_patches(
+            before,
+            [
+                {"insert_after": "Mara enters the office.", "insert": "She catalogued the bills by date."},
+                {"insert_after": "Mara enters the office.", "insert": "She filed the envelopes in a stack."},
+            ],
+            [],
+            ["Mara enters the office."],
+        )
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["text"], before)
+        self.assertIn("repeats a verified insertion anchor", result["errors"][0])
+
+    def test_missing_acceptance_outcome_repairs_at_verified_insertion_anchor(self):
+        engine = object.__new__(WritingEngine)
+        engine.llm = Mock()
+        source = "Mara enters the office.\n\nShe opens the tax box."
+        engine.llm.chat.return_value = {"content": json.dumps({
+            "patches": [{
+                "insert_after": "Mara enters the office.",
+                "insert": "She catalogued the unopened bills by date.",
+            }],
+        })}
+
+        result = engine.repair_chapter_with_verified_patches(source, {
+            "outcomes": [{
+                "id": "ch0001-requirement-01", "status": "missing",
+                "requirement": "Mara catalogues the bills.", "reason": "The bills are absent.",
+                "insertion_anchor": "Mara enters the office.",
+            }],
+            "findings": [],
+        })
+
+        self.assertEqual(
+            result["content"],
+            "Mara enters the office.\n\nShe catalogued the unopened bills by date.\n\nShe opens the tax box.",
+        )
+
+    def test_acceptance_patch_allows_json_code_fence_but_keeps_scope_validation(self):
+        engine = object.__new__(WritingEngine)
+        engine.llm = Mock()
+        source = "Opening stays. The cited sentence is wrong. Ending stays."
+        engine.llm.chat.return_value = {"content": "```json\n" + json.dumps({
+            "patches": [{
+                "find": "The cited sentence is wrong.",
+                "replace": "The cited sentence is precise.",
+            }],
+        }) + "\n```"}
+
+        result = engine.repair_chapter_with_verified_patches(source, {
+            "outcomes": [],
+            "findings": [{
+                "category": "clarity_idiomaticity",
+                "repair_scope": "sentence",
+                "reason": "The wording is imprecise.",
+                "evidence_quotes": ["The cited sentence is wrong."],
+            }],
+        })
+
+        self.assertEqual(result["content"], "Opening stays. The cited sentence is precise. Ending stays.")
+
+    def test_unclear_acceptance_outcome_repairs_at_verified_insertion_anchor(self):
+        engine = object.__new__(WritingEngine)
+        engine.llm = Mock()
+        source = "Mara enters the office.\n\nShe opens the tax box."
+        engine.llm.chat.return_value = {"content": json.dumps({
+            "patches": [{
+                "insert_after": "Mara enters the office.",
+                "insert": "She catalogued the unopened bills by date.",
+            }],
+        })}
+
+        result = engine.repair_chapter_with_verified_patches(source, {
+            "outcomes": [{
+                "id": "ch0001-requirement-01", "status": "unclear",
+                "requirement": "Mara catalogues the bills.", "reason": "The bills are not explicit.",
+                "evidence_quotes": ["Mara enters the office."],
+                "insertion_anchor": "Mara enters the office.",
+            }],
+            "findings": [],
+        })
+
+        self.assertIn("catalogued the unopened bills", result["content"])
+
     def test_missing_acceptance_outcome_fails_without_model_rewrite(self):
         engine = object.__new__(WritingEngine)
         engine.llm = Mock()
@@ -89,7 +201,7 @@ class StrictLocalRepairTests(unittest.TestCase):
             {"outcomes": [{"id": "ch0001-requirement-01", "status": "missing"}], "findings": []},
         )
 
-        self.assertIn("no verified edit anchor", result["error"])
+        self.assertIn("no verified insertion anchor", result["error"])
         engine.llm.chat.assert_not_called()
 
 

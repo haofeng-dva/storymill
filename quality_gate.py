@@ -154,7 +154,7 @@ def load_state_evidence(path):
     return value if isinstance(value, dict) else None
 
 
-def chapter_acceptance_decision(review, source_text=None, local_blockers=None):
+def chapter_acceptance_decision(review, source_text=None, local_blockers=None, issue_ledger=None):
     """Make one fail-closed chapter decision from a source-hashed acceptance audit."""
     local_blockers = list(local_blockers or [])
     if not isinstance(review, dict) or review.get("error"):
@@ -170,9 +170,56 @@ def chapter_acceptance_decision(review, source_text=None, local_blockers=None):
     for outcome in review.get("outcomes", []):
         if outcome.get("status") != "met":
             blockers.append(f"outline outcome {outcome.get('id', '?')} is {outcome.get('status', 'missing')}")
+    if issue_ledger is not None:
+        ledger_items = issue_ledger.get("items") if isinstance(issue_ledger, dict) else None
+        assessments = review.get("ledger_assessment")
+        if not isinstance(ledger_items, list) or not isinstance(assessments, list):
+            return {"decision": "verification_failed", "blockers": ["acceptance review has no validated initial issue ledger assessment"]}
+        ledger_by_id = {item.get("id"): item for item in ledger_items if isinstance(item, dict) and item.get("id")}
+        assessment_by_id = {item.get("id"): item for item in assessments if isinstance(item, dict) and item.get("id")}
+        if (
+            len(ledger_by_id) != len(ledger_items)
+            or len(assessment_by_id) != len(assessments)
+            or set(assessment_by_id) != set(ledger_by_id)
+        ):
+            return {"decision": "verification_failed", "blockers": ["acceptance ledger assessment does not cover the frozen initial issue ledger"]}
+        repair_findings = []
+        for item_id, original in ledger_by_id.items():
+            assessment = assessment_by_id[item_id]
+            if assessment.get("status") not in {"resolved", "unresolved"}:
+                return {"decision": "verification_failed", "blockers": [f"acceptance ledger item {item_id} has an invalid status"]}
+            if assessment["status"] == "unresolved":
+                finding = {
+                    "id": item_id,
+                    "category": original.get("category"),
+                    "repair_scope": original.get("repair_scope"),
+                    "reason": assessment.get("reason"),
+                    "evidence_quotes": assessment.get("evidence_quotes"),
+                }
+                if not isinstance(finding["reason"], str) or not finding["reason"].strip() or not isinstance(finding["evidence_quotes"], list) or not finding["evidence_quotes"]:
+                    return {"decision": "verification_failed", "blockers": [f"unresolved acceptance ledger item {item_id} has no usable repair evidence"]}
+                blockers.append(f"initial issue {item_id} is unresolved: {finding['reason']}")
+                repair_findings.append(finding)
+        # A recheck is not clean while it identifies a new, quote-verified
+        # defect. Carry it into the remaining bounded repair budget instead
+        # of recording it as an advisory observation and writing the chapter.
+        for finding in review.get("findings", []):
+            blockers.append(f"{finding.get('category', 'editorial finding')}: {finding.get('reason', 'repair required')}")
+            repair_findings.append(finding)
+        return {
+            "decision": "passed" if not blockers else "repair_required",
+            "blockers": blockers,
+            "repair_findings": repair_findings,
+            "observations": [],
+        }
     for finding in review.get("findings", []):
         blockers.append(f"{finding.get('category', 'editorial finding')}: {finding.get('reason', 'repair required')}")
-    return {"decision": "passed" if not blockers else "repair_required", "blockers": blockers}
+    return {
+        "decision": "passed" if not blockers else "repair_required",
+        "blockers": blockers,
+        "repair_findings": list(review.get("findings", [])),
+        "observations": [],
+    }
 
 
 def build_report(text, chapter_no, blind=None, previous_state=None, current_state=None, local_warnings=None,

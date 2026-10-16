@@ -69,6 +69,7 @@ ACCEPTANCE_CATEGORIES = {
     "abstract_template",
 }
 ACCEPTANCE_REPAIR_SCOPES = {"sentence", "paragraph", "scene", "chapter"}
+ACCEPTANCE_LEDGER_SCHEMA = "chapter_acceptance_issue_ledger_v1"
 
 
 def request_json_bounded(req, timeout=REVIEW_REQUEST_TIMEOUT_SECONDS):
@@ -121,19 +122,27 @@ def load_env(path=None):
 class GPTNativeReviewer:
     """母语级审稿：复用最终编辑已验证的 relay chat-completions 协议。"""
 
-    def __init__(self, env):
+    def __init__(self, env, model=None, primary_attempts=None,
+                 fallback_model=None, fallback_attempts=None):
         self.base = env.get("OPENAI_RELAY_BASE", "").rstrip("/")
         self.key = env.get("OPENAI_RELAY_KEY", "")
-        self.model = env.get("OPENAI_RELAY_MODEL", "gpt-5.6-sol")
+        self.model = model or env.get("OPENAI_RELAY_MODEL", "gpt-5.6-sol")
         cfg = load_json(os.path.join(HERE, "config.json"))
         relay = cfg.get("llm", {}).get("relay", {})
         self.relay_headers = relay.get("headers", {})
-        # Keep review failover aligned with writing: try the primary relay model
-        # twice, then use the separately proven GPT-5.5 path.
+        # The acceptance path can use a model distinct from ordinary native
+        # checks while keeping the existing defaults for all other callers.
         fallback = relay.get("writer_fallback", {})
-        self.primary_attempts = max(1, int(fallback.get("primary_max_attempts", 2)))
-        self.fallback_model = fallback.get("model", "gpt-5.5")
-        self.fallback_attempts = max(1, int(fallback.get("fallback_max_attempts", 2)))
+        default_primary_attempts = fallback.get("primary_max_attempts", 2)
+        default_fallback_model = fallback.get("model", "gpt-5.5")
+        default_fallback_attempts = fallback.get("fallback_max_attempts", 2)
+        self.primary_attempts = max(1, int(
+            default_primary_attempts if primary_attempts is None else primary_attempts
+        ))
+        self.fallback_model = default_fallback_model if fallback_model is None else fallback_model
+        self.fallback_attempts = max(1, int(
+            default_fallback_attempts if fallback_attempts is None else fallback_attempts
+        ))
 
     def _headers(self):
         headers = {"Content-Type": "application/json"}
@@ -147,7 +156,8 @@ class GPTNativeReviewer:
             headers[name] = value
         return headers
 
-    def _call_model(self, model, messages, max_tokens):
+    def _call_model(self, model, messages, max_tokens,
+                    request_timeout_seconds=REVIEW_REQUEST_TIMEOUT_SECONDS):
         body = {
             "model": model,
             "messages": messages,
@@ -159,7 +169,7 @@ class GPTNativeReviewer:
             data=json.dumps(body).encode("utf-8"),
             headers=self._headers(),
         )
-        data, error = request_json_bounded(req)
+        data, error = request_json_bounded(req, timeout=request_timeout_seconds)
         if error:
             return {"error": error}
         try:
@@ -170,14 +180,18 @@ class GPTNativeReviewer:
             return {"error": "empty provider response"}
         return {"content": text_out}
 
-    def _call(self, messages, max_tokens=1200):
+    def _call(self, messages, max_tokens=1200,
+              request_timeout_seconds=REVIEW_REQUEST_TIMEOUT_SECONDS):
         attempts = [(self.model, self.primary_attempts)]
         if self.fallback_model and self.fallback_model != self.model:
             attempts.append((self.fallback_model, self.fallback_attempts))
         errors = []
         for model, count in attempts:
             for attempt in range(1, count + 1):
-                result = self._call_model(model, messages, max_tokens)
+                result = self._call_model(
+                    model, messages, max_tokens,
+                    request_timeout_seconds=request_timeout_seconds,
+                )
                 if "error" not in result:
                     result["model"] = model
                     return result
@@ -224,7 +238,8 @@ class DeepSeekReviewer:
         self.api_key = env.get(cfg["llm"]["api_key_env"], "")
         self.model = cfg["llm"]["models"]["reviewer"]
 
-    def _call(self, messages, max_tokens):
+    def _call(self, messages, max_tokens,
+              request_timeout_seconds=REVIEW_REQUEST_TIMEOUT_SECONDS):
         req = urllib.request.Request(
             self.base_url + "/chat/completions",
             data=json.dumps({
@@ -235,7 +250,7 @@ class DeepSeekReviewer:
             }).encode("utf-8"),
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
         )
-        data, error = request_json_bounded(req)
+        data, error = request_json_bounded(req, timeout=request_timeout_seconds)
         if error:
             return {"error": error}
         try:
@@ -435,22 +450,101 @@ def extract_chapter_requirements(outline_text, chapter_no):
     return requirements
 
 
-def _acceptance_user_prompt(text, requirements):
+def _ledger_items(issue_ledger):
+    if not isinstance(issue_ledger, dict) or set(issue_ledger) != {
+        "schema_version", "chapter", "initial_source_sha256", "items",
+    }:
+        raise ValueError("chapter acceptance issue ledger has an invalid shape")
+    if issue_ledger.get("schema_version") != ACCEPTANCE_LEDGER_SCHEMA or not isinstance(issue_ledger.get("chapter"), int):
+        raise ValueError("chapter acceptance issue ledger has an invalid header")
+    source_sha256 = issue_ledger.get("initial_source_sha256")
+    if not isinstance(source_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+        raise ValueError("chapter acceptance issue ledger has an invalid source hash")
+    items = issue_ledger.get("items")
+    if not isinstance(items, list):
+        raise ValueError("chapter acceptance issue ledger items must be an array")
+    seen = set()
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict) or set(item) != {"id", "category", "evidence_quotes", "reason", "repair_scope"}:
+            raise ValueError("chapter acceptance issue ledger item has an invalid shape")
+        expected_id = f"ch{issue_ledger['chapter']:04d}-ledger-{index:02d}"
+        if item.get("id") != expected_id or item["id"] in seen:
+            raise ValueError("chapter acceptance issue ledger IDs must be stable and unique")
+        seen.add(item["id"])
+        if item.get("category") not in ACCEPTANCE_CATEGORIES or item.get("repair_scope") not in ACCEPTANCE_REPAIR_SCOPES:
+            raise ValueError("chapter acceptance issue ledger item has invalid repair metadata")
+        if not isinstance(item.get("reason"), str) or not item["reason"].strip() or not _exact_quotes(
+            item.get("evidence_quotes"), "\n".join(item.get("evidence_quotes") or []),
+            2 if item.get("category") == "duplicate_scene" else 1,
+        ):
+            raise ValueError("chapter acceptance issue ledger item has invalid evidence")
+    return items
+
+
+def freeze_acceptance_issue_ledger(chapter_no, review):
+    """Freeze verified first-pass blockers so later audits cannot move the goalposts."""
+    findings = review.get("findings") if isinstance(review, dict) else None
+    source_sha256 = review.get("source_sha256") if isinstance(review, dict) else None
+    if not isinstance(findings, list) or not isinstance(source_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+        raise ValueError("cannot freeze an invalid acceptance review")
+    ledger = {
+        "schema_version": ACCEPTANCE_LEDGER_SCHEMA,
+        "chapter": int(chapter_no),
+        "initial_source_sha256": source_sha256,
+        "items": [
+            {
+                "id": f"ch{int(chapter_no):04d}-ledger-{index:02d}",
+                "category": finding["category"],
+                "evidence_quotes": list(finding["evidence_quotes"]),
+                "reason": finding["reason"],
+                "repair_scope": finding["repair_scope"],
+            }
+            for index, finding in enumerate(findings, start=1)
+        ],
+    }
+    _ledger_items(ledger)
+    return ledger
+
+
+def _acceptance_user_prompt(text, requirements, issue_ledger=None):
     contract = json.dumps(requirements, ensure_ascii=False)
+    ledger_items = _ledger_items(issue_ledger) if issue_ledger is not None else None
+    ledger_instruction = ""
+    ledger_context = ""
+    response_keys = "outcomes and findings"
+    if ledger_items is not None:
+        response_keys += " and ledger_assessment"
+        ledger_instruction = (
+            "ledger_assessment must contain exactly one object for every supplied initial ledger item: "
+            "{id,status,evidence_quotes,reason}. status is resolved or unresolved. For unresolved, quote the exact current "
+            "text that still has that same original defect (two quotes for duplicate_scene). For resolved, evidence_quotes must "
+            "be []. Do not add a new item to ledger_assessment. New editorial findings still belong only in findings.\n\n"
+        )
+        ledger_context = "Initial blocking issue ledger; assess every item without changing its ID:\n" + json.dumps(
+            ledger_items, ensure_ascii=False,
+        ) + "\n\n"
     return (
         "Audit this completed English-fiction chapter for production acceptance. "
-        "Return JSON only, with exactly the keys outcomes and findings. Do not return scores.\n\n"
+        f"Return JSON only, with exactly the keys {response_keys}. Do not return scores.\n\n"
         "For every supplied requirement, outcomes must contain exactly one object "
-        "{id,status,evidence_quotes,reason}. status is met, missing, or unclear. "
-        "A met outcome needs one or more literal contiguous quotations from the chapter proving the required result. "
-        "Do not infer an outcome from setup, intention, or a later chapter.\n\n"
+        "{id,status,evidence_quotes,insertion_anchor,reason}. status is met, missing, or unclear. "
+        "A met outcome needs one short literal contiguous quotation from the chapter proving the required result. "
+        "Copy evidence strings without adding quotation marks unless the quotation mark itself is source text. "
+        "For missing, evidence_quotes must be [] and insertion_anchor must be one unique, complete existing paragraph copied "
+        "exactly from the chapter, after which the missing outcome can be restored with one small paragraph. For unclear, "
+        "evidence_quotes must quote the related but insufficient text, and insertion_anchor must be one unique, complete "
+        "existing paragraph after which the uncertain result can be made explicit with one small paragraph. For met, "
+        "insertion_anchor must be null. Do not infer an outcome from setup, intention, or a later chapter.\n\n"
         "findings is an array. Each finding must contain exactly category, evidence_quotes, reason, repair_scope. "
         "category must be one of duplicate_scene, continuity_causality, scene_staging, clarity_idiomaticity, abstract_template. "
         "evidence_quotes must be literal contiguous quotations from the chapter. A duplicate_scene finding needs two quotations, "
-        "one for each materially repeated progression. Report every concrete problem in these categories that prevents publication; "
+        "one for each materially repeated progression. Keep every reason to one short sentence and quote only the smallest "
+        "passage needed to prove it. Report every concrete problem in these categories that prevents publication; "
         "do not soften a confirmed problem because the chapter is otherwise good. Use [] only when none exist. "
         "repair_scope must be sentence, paragraph, scene, or chapter.\n\n"
-        "Required chapter outcomes:\n"
+        + ledger_instruction
+        + ledger_context
+        + "Required chapter outcomes:\n"
         + contract
         + "\n\nChapter text:\n---\n"
         + text
@@ -458,26 +552,36 @@ def _acceptance_user_prompt(text, requirements):
     )
 
 
-def acceptance_review_with_fallback(text, requirements, reviewers):
+def acceptance_review_with_fallback(text, requirements, reviewers, issue_ledger=None):
     """Run the stricter acceptance audit through the existing reviewer fallback chain."""
-    user = _acceptance_user_prompt(text, requirements)
+    user = _acceptance_user_prompt(text, requirements, issue_ledger)
     system = (
         "You are a meticulous native English fiction editor. You enforce chapter contracts and publication-level prose clarity. "
         "Never invent quotations. A reported problem must be tied to exact supplied text."
     )
     errors = []
     for name, reviewer in reviewers:
-        if isinstance(reviewer, GeminiReviewer):
-            result = reviewer._call(system, user)
-        else:
-            result = reviewer._call([
-                {"role": "developer", "content": system},
-                {"role": "user", "content": user},
-            ], max_tokens=2600)
-        if "error" not in result and result.get("content", "").strip():
-            model = result.get("model", getattr(reviewer, "model", name))
-            return result["content"], f"{model} ({name})"
-        errors.append(f"{name}: {result.get('error') or 'empty'}")
+        attempts = 1 if isinstance(reviewer, GeminiReviewer) else max(
+            1, int(getattr(reviewer, "acceptance_attempts", 1)),
+        )
+        for attempt in range(1, attempts + 1):
+            if isinstance(reviewer, GeminiReviewer):
+                result = reviewer._call(system, user)
+            else:
+                result = reviewer._call([
+                    {"role": "developer", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                    max_tokens=getattr(reviewer, "acceptance_max_tokens", 2600),
+                    request_timeout_seconds=getattr(
+                        reviewer, "acceptance_timeout_seconds", REVIEW_REQUEST_TIMEOUT_SECONDS
+                    ),
+                )
+            if "error" not in result and result.get("content", "").strip():
+                model = result.get("model", getattr(reviewer, "model", name))
+                return result["content"], f"{model} ({name})"
+            label = name if attempts == 1 else f"{name} attempt {attempt}"
+            errors.append(f"{label}: {result.get('error') or 'empty'}")
     return None, "; ".join(errors)
 
 
@@ -494,14 +598,36 @@ def _exact_quotes(value, text, minimum=1):
     return quotes if all(quote in text for quote in quotes) else None
 
 
-def parse_acceptance_review(content, text, requirements):
+def _unique_complete_paragraph(value, text):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    anchor = value.strip()
+    start = text.find(anchor)
+    if start < 0 or text.find(anchor, start + 1) >= 0:
+        return None
+    before, after = text[:start], text[start + len(anchor):]
+    if before and re.search(r"\n\s*\n\s*$", before) is None:
+        return None
+    if after and re.match(r"^\s*\n\s*\n", after) is None:
+        return None
+    return anchor
+
+
+def parse_acceptance_review(content, text, requirements, issue_ledger=None):
     """Validate a reviewer response before it can influence a chapter decision."""
     try:
         payload = _json_object(content)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         return {"error": f"invalid acceptance JSON: {exc}"}
-    if not isinstance(payload, dict) or set(payload) != {"outcomes", "findings"}:
-        return {"error": "acceptance review must contain only outcomes and findings"}
+    try:
+        ledger_items = _ledger_items(issue_ledger) if issue_ledger is not None else None
+    except ValueError as exc:
+        return {"error": str(exc)}
+    expected_keys = {"outcomes", "findings"}
+    if ledger_items is not None:
+        expected_keys.add("ledger_assessment")
+    if not isinstance(payload, dict) or set(payload) != expected_keys:
+        return {"error": "acceptance review must contain exactly the requested keys"}
     expected = {item["id"]: item["requirement"] for item in requirements}
     outcomes = payload.get("outcomes")
     findings = payload.get("findings")
@@ -510,21 +636,31 @@ def parse_acceptance_review(content, text, requirements):
     normalized_outcomes = []
     seen = set()
     for item in outcomes:
-        if not isinstance(item, dict) or set(item) != {"id", "status", "evidence_quotes", "reason"}:
+        if not isinstance(item, dict) or set(item) != {"id", "status", "evidence_quotes", "insertion_anchor", "reason"}:
             return {"error": "every acceptance outcome has an invalid shape"}
         outcome_id = item.get("id")
         status = item.get("status")
         if outcome_id not in expected or outcome_id in seen or status not in {"met", "missing", "unclear"}:
             return {"error": "acceptance outcomes do not match the chapter contract"}
         seen.add(outcome_id)
-        quotes = _exact_quotes(item.get("evidence_quotes"), text) if status == "met" else []
-        if status == "met" and not quotes:
-            return {"error": f"met outcome {outcome_id} lacks an exact chapter quotation"}
+        quotes = _exact_quotes(item.get("evidence_quotes"), text) if status in {"met", "unclear"} else []
+        if status in {"met", "unclear"} and not quotes:
+            return {"error": f"{status} outcome {outcome_id} lacks an exact chapter quotation"}
+        insertion_anchor = None
+        if status in {"missing", "unclear"}:
+            if item.get("evidence_quotes") != []:
+                if status == "missing":
+                    return {"error": f"missing outcome {outcome_id} must not use evidence quotes"}
+            insertion_anchor = _unique_complete_paragraph(item.get("insertion_anchor"), text)
+            if not insertion_anchor:
+                return {"error": f"missing outcome {outcome_id} lacks a unique complete insertion paragraph"}
+        elif item.get("insertion_anchor") is not None:
+            return {"error": f"{status} outcome {outcome_id} must not have an insertion anchor"}
         if not isinstance(item.get("reason"), str) or not item["reason"].strip():
             return {"error": f"outcome {outcome_id} lacks a reason"}
         normalized_outcomes.append({
             "id": outcome_id, "requirement": expected[outcome_id], "status": status,
-            "evidence_quotes": quotes, "reason": item["reason"].strip(),
+            "evidence_quotes": quotes, "insertion_anchor": insertion_anchor, "reason": item["reason"].strip(),
         })
     if seen != set(expected):
         return {"error": "acceptance review did not assess every chapter requirement"}
@@ -542,32 +678,119 @@ def parse_acceptance_review(content, text, requirements):
             "category": category, "evidence_quotes": quotes, "reason": item["reason"].strip(),
             "repair_scope": item["repair_scope"],
         })
-    return {"outcomes": normalized_outcomes, "findings": normalized_findings}
+    normalized_ledger_assessment = []
+    if ledger_items is not None:
+        assessments = payload.get("ledger_assessment")
+        if not isinstance(assessments, list):
+            return {"error": "acceptance ledger assessment must be an array"}
+        ledger_by_id = {item["id"]: item for item in ledger_items}
+        seen = set()
+        for assessment in assessments:
+            if not isinstance(assessment, dict) or set(assessment) != {"id", "status", "evidence_quotes", "reason"}:
+                return {"error": "every acceptance ledger assessment has an invalid shape"}
+            item_id = assessment.get("id")
+            status = assessment.get("status")
+            if item_id not in ledger_by_id or item_id in seen or status not in {"resolved", "unresolved"}:
+                return {"error": "acceptance ledger assessment does not match the initial issue ledger"}
+            seen.add(item_id)
+            original = ledger_by_id[item_id]
+            if status == "resolved":
+                if assessment.get("evidence_quotes") != []:
+                    return {"error": f"resolved ledger item {item_id} must not use evidence quotes"}
+                quotes = []
+            else:
+                quotes = _exact_quotes(
+                    assessment.get("evidence_quotes"), text,
+                    2 if original["category"] == "duplicate_scene" else 1,
+                )
+                if not quotes:
+                    return {"error": f"unresolved ledger item {item_id} lacks an exact chapter quotation"}
+            if not isinstance(assessment.get("reason"), str) or not assessment["reason"].strip():
+                return {"error": f"ledger item {item_id} lacks a reason"}
+            normalized_ledger_assessment.append({
+                "id": item_id, "status": status, "category": original["category"],
+                "repair_scope": original["repair_scope"], "evidence_quotes": quotes,
+                "reason": assessment["reason"].strip(),
+            })
+        if seen != set(ledger_by_id):
+            return {"error": "acceptance review did not assess every initial ledger item"}
+    result = {"outcomes": normalized_outcomes, "findings": normalized_findings}
+    if ledger_items is not None:
+        result["ledger_assessment"] = normalized_ledger_assessment
+    return result
 
 
-def build_acceptance_reviewers():
+def build_acceptance_reviewers(acceptance_config=None):
     """Reuse the existing providers; acceptance is a stricter policy, not a new service."""
     env = load_env()
     cfg = load_json(os.path.join(HERE, "config.json"))
+    acceptance_config = acceptance_config or {}
+    if not isinstance(acceptance_config, dict):
+        raise ValueError("chapter_acceptance configuration must be an object")
+    gpt = GPTNativeReviewer(
+        env,
+        model=acceptance_config.get("gpt_model"),
+        primary_attempts=acceptance_config.get("gpt_primary_attempts"),
+        fallback_model=acceptance_config.get("gpt_fallback_model"),
+        fallback_attempts=acceptance_config.get("gpt_fallback_attempts"),
+    )
+    gpt.acceptance_max_tokens = max(256, int(acceptance_config.get("gpt_max_output_tokens", 2600)))
+    gpt.acceptance_timeout_seconds = max(
+        REVIEW_REQUEST_TIMEOUT_SECONDS,
+        int(acceptance_config.get("gpt_request_timeout_seconds", REVIEW_REQUEST_TIMEOUT_SECONDS)),
+    )
+    glm = DeepSeekReviewer(cfg, env)
+    glm.acceptance_max_tokens = max(256, int(acceptance_config.get("glm_max_output_tokens", 900)))
+    glm.acceptance_attempts = max(1, min(2, int(acceptance_config.get("glm_attempts", 1))))
+    glm.acceptance_timeout_seconds = max(
+        REVIEW_REQUEST_TIMEOUT_SECONDS,
+        int(acceptance_config.get("glm_request_timeout_seconds", REVIEW_REQUEST_TIMEOUT_SECONDS)),
+    )
     return [
-        ("gpt", GPTNativeReviewer(env)),
-        ("glm", DeepSeekReviewer(cfg, env)),
+        ("glm", glm),
+        ("gpt", gpt),
         ("gemini", GeminiReviewer(env)),
     ]
 
 
-def review_chapter_acceptance(name, text, requirements, reviewers):
+def review_chapter_acceptance(name, text, requirements, reviewers, issue_ledger=None):
     """Return a source-hashed acceptance audit or a fail-closed verification error."""
     source_sha256 = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
     if not requirements:
         return {"file": name, "source_sha256": source_sha256, "error": "chapter outline has no extractable requirements"}
-    content, provider = acceptance_review_with_fallback(text, requirements, reviewers)
-    if content is None:
-        return {"file": name, "source_sha256": source_sha256, "error": f"acceptance reviewer unavailable: {provider}"}
-    parsed = parse_acceptance_review(content, text, requirements)
+    try:
+        _ledger_items(issue_ledger) if issue_ledger is not None else None
+    except ValueError as exc:
+        return {"file": name, "source_sha256": source_sha256, "error": str(exc)}
+    remaining_reviewers = list(reviewers)
+    errors = []
+    while remaining_reviewers:
+        content, provider = acceptance_review_with_fallback(
+            text, requirements, remaining_reviewers, issue_ledger
+        )
+        if content is None:
+            errors.append(f"reviewer unavailable: {provider}")
+            break
+        parsed = parse_acceptance_review(content, text, requirements, issue_ledger)
+        if "error" not in parsed:
+            return {
+                "file": name, "source_sha256": source_sha256, "provider": provider,
+                "content": content, "requirements": requirements, **parsed,
+            }
+        errors.append(f"{provider}: {parsed['error']}")
+        provider_name = next(
+            (candidate for candidate, _reviewer in remaining_reviewers if provider.endswith(f"({candidate})")),
+            None,
+        )
+        if provider_name is None:
+            break
+        remaining_reviewers = [
+            item for item in remaining_reviewers if item[0] != provider_name
+        ]
     return {
-        "file": name, "source_sha256": source_sha256, "provider": provider,
-        "content": content, "requirements": requirements, **parsed,
+        "file": name,
+        "source_sha256": source_sha256,
+        "error": "acceptance reviewer unavailable or returned invalid output: " + "; ".join(errors),
     }
 
 
