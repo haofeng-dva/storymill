@@ -1,0 +1,37 @@
+{
+  "archive_date": "2026-10-27",
+  "workspace_inventory": {
+    "python_files": 99,
+    "source_python_files": 69,
+    "test_python_files": 30,
+    "python_lines": 20730,
+    "markdown_documents": 36,
+    "out_run_directories": 75,
+    "out_files": 737,
+    "shorts_files": 1803
+  },
+  "verification": {
+    "command": "py -3 -m unittest discover -p \"test_*.py\"",
+    "tests_passed": 375,
+    "result": "OK",
+    "known_warning": "ResourceWarning from existing file handles"
+  },
+  "production_evidence": {
+    "documented_complete_sample_chapters": 12,
+    "documented_complete_sample_words": 30474,
+    "documented_complete_sample_hooks": 10,
+    "documented_issue_groups": 19,
+    "documented_issue_instances_approx": 45,
+    "portfolio_complete_sample_directories": 3,
+    "portfolio_incomplete_run_directories": 1,
+    "historical_streaming_request_seconds_approx": 125,
+    "historical_gateway_failure_seconds_approx": 60
+  },
+  "release_boundary": {
+    "public_code_and_docs": true,
+    "secrets": false,
+    "runtime_state": false,
+    "full_story_text": false,
+    "publication_ready_claim": false
+  }
+}

@@ -10,7 +10,7 @@ quality_probe.py — 质量探针（P0 第一道门）
   5. native-check 评分（可选，需 --native 触发，调 reasoning 模型）
 
 用法:
-    py -3 quality_probe.py --inkos-baseline C:\\Users\\唐杰\\Desktop\\OH-WorkSpace\\inkos-test\\shorts\\the-ledger-of-grief\\final\\short-story.json --mine shorts\\probe_test
+    py -3 quality_probe.py --inkos-baseline <INKOS_BASELINE_JSON> --mine shorts\\probe_test
 
 输出: probe/report.md 对比报告
 """

@@ -199,9 +199,11 @@ def _scene_findings(chapter, scenes, statuses, chapter_text):
     return findings
 
 
-def _fact_findings(chapter, scenes, statuses, chapter_text):
+def _fact_findings(chapter, scenes, statuses, chapter_text, additional_fact_slots=()):
     findings = []
     expected = {fact["id"]: fact for scene in scenes for fact in scene["fact_slots"]}
+    expected.update({fact["id"]: fact for fact in additional_fact_slots})
+    observational_ids = {fact["id"] for fact in additional_fact_slots}
     observed = {item["fact_id"]: item for item in statuses}
     for fact_id, fact in expected.items():
         item = observed.get(fact_id)
@@ -210,21 +212,19 @@ def _fact_findings(chapter, scenes, statuses, chapter_text):
             continue
         if chapter_text is not None and item["evidence"] not in chapter_text:
             findings.append(_finding(chapter, "fact-evidence-not-found", f"Evidence for fact slot {fact_id} is not a verbatim chapter quotation.", fact_id=fact_id))
-        # A discrete fact is only proven when the reported value appears in
-        # the exact quotation that allegedly establishes it. This is local and
-        # prevents a state extractor from labelling a conflicting quote as
-        # "consistent" merely by copying the contract value into its JSON.
-        if item["status"] in ("consistent", "contradicted") and item["value"] not in item["evidence"]:
-            findings.append(_finding(
-                chapter,
-                "fact-evidence-value-not-found",
-                f"Evidence for fact slot {fact_id} does not contain its reported value {item['value']!r}.",
-                fact_id=fact_id,
-                expected_value=fact["value"],
-                observed_value=item["value"],
-                evidence=item["evidence"],
-            ))
-        if item["status"] != "consistent" or item["value"] != fact["value"]:
+        # ``value`` is the contract's canonical summary, whereas ``evidence``
+        # is a verbatim natural-language quotation. They need not use the same
+        # words: for example, a spoken rejection can establish a contract
+        # summary of that rejection. The status model compares their meaning;
+        # this local layer only verifies the quote belongs to the chapter and
+        # that its reported result agrees with the contract below.
+        # Story-bible canon protects against contradiction, not compulsory
+        # restatement. A chapter may not actively establish every contextual
+        # canon fact it uses, so an ``unclear`` observational result is not a
+        # failure when it retains the canonical value. Scene contract slots
+        # remain strict and require ``consistent``.
+        allowed_statuses = ("consistent", "unclear") if fact_id in observational_ids else ("consistent",)
+        if item["status"] not in allowed_statuses or item["value"] != fact["value"]:
             findings.append(_finding(
                 chapter,
                 "fact-value-conflict",
@@ -239,7 +239,27 @@ def _fact_findings(chapter, scenes, statuses, chapter_text):
     return findings
 
 
-def check_state_delta(contract, delta, chapter_text=None, scenes=None):
+def _fact_slot_coverage_findings(chapter, contract, scenes):
+    """Fail closed when a declared canonical fact has no executable scene slot."""
+    covered = {
+        fact["id"]
+        for scene in scenes
+        for fact in scene.get("fact_slots", [])
+    }
+    findings = []
+    for fact in contract.get("facts", []):
+        if fact["id"] not in covered:
+            findings.append(_finding(
+                chapter,
+                "fact-slot-not-covered",
+                f"Declared fact {fact['id']} has no scene fact slot.",
+                fact_id=fact["id"],
+                expected_value=fact.get("value"),
+            ))
+    return findings
+
+
+def check_state_delta(contract, delta, chapter_text=None, scenes=None, additional_fact_slots=()):
     """Validate atomic contract assertions without comparing free-form state prose."""
     findings = []
     chapter = delta["chapter"]
@@ -247,7 +267,10 @@ def check_state_delta(contract, delta, chapter_text=None, scenes=None):
     findings.extend(_assertion_findings(chapter, contract.get("must_not_regress", []), delta["non_regression_statuses"], "preserved", "non-regression", chapter_text))
     if scenes is not None:
         findings.extend(_scene_findings(chapter, scenes, delta["scene_statuses"], chapter_text))
-        findings.extend(_fact_findings(chapter, scenes, delta["fact_statuses"], chapter_text))
+        findings.extend(_fact_slot_coverage_findings(chapter, contract, scenes))
+        findings.extend(_fact_findings(
+            chapter, scenes, delta["fact_statuses"], chapter_text, additional_fact_slots,
+        ))
     for conflict in delta["conflicts_with_contract"]:
         # This field is a model observation without an ID/value/quote contract.
         # It remains visible for review but cannot override the atomic checks.
@@ -258,10 +281,12 @@ def check_state_delta(contract, delta, chapter_text=None, scenes=None):
     return findings
 
 
-def evaluate_state_delta_output(content, chapter, source_sha256, contract, chapter_text, scenes=None):
+def evaluate_state_delta_output(
+    content, chapter, source_sha256, contract, chapter_text, scenes=None, additional_fact_slots=(),
+):
     """Parse and validate one state-delta response through the only runtime path."""
     delta = parse_state_delta_output(content, chapter, source_sha256)
-    return delta, check_state_delta(contract, delta, chapter_text, scenes)
+    return delta, check_state_delta(contract, delta, chapter_text, scenes, additional_fact_slots)
 
 
 def write_state_delta(control_dir, delta, findings):
@@ -291,6 +316,8 @@ def append_control_findings(output_path, findings):
         for index, item in enumerate(existing.get("findings", []))
     }
     for finding in findings:
+        finding = dict(finding)
+        finding.setdefault("status", "detected")
         if not finding.get("card_id"):
             digest = sha256_text(f"{finding.get('chapter')}\0{finding.get('rule_id')}\0{finding.get('message')}")[:12]
             finding = {**finding, "card_id": f"ch{finding.get('chapter', 0):04d}-{finding.get('rule_id', 'finding')}-{digest}"}
@@ -302,9 +329,59 @@ def append_control_findings(output_path, findings):
             # A revalidation can legitimately refine a card from blocking to
             # manual review. Keep its stable id while replacing stale fields.
             prior = existing["findings"][known[key]]
-            existing["findings"][known[key]] = {**prior, **finding}
+            # A previously resolved card becomes active again only when the
+            # same defect is observed in a later validation.
+            replacement = {**prior, **finding}
+            if prior.get("status") == "resolved":
+                replacement.pop("resolution", None)
+            existing["findings"][known[key]] = replacement
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def active_control_findings(output_path):
+    """Return the active cards only; resolved cards remain auditable on disk."""
+    path = Path(output_path)
+    if not path.is_file():
+        return []
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlContractError(f"cannot read existing findings {path}: {exc}") from exc
+    return [item for item in report.get("findings", []) if item.get("status", "detected") != "resolved"]
+
+
+def resolve_control_state_findings(output_path, chapter, source_sha256):
+    """Close superseded state cards after the current chapter validates cleanly.
+
+    Findings from other sources stay active. A successful rerun supersedes
+    earlier state-extraction failures for the chapter even after a rewrite
+    changes its source hash; both hashes remain in the resolution record.
+    """
+    path = Path(output_path)
+    if not path.is_file():
+        return path
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlContractError(f"cannot read existing findings {path}: {exc}") from exc
+    changed = False
+    for item in report.get("findings", []):
+        if (
+            item.get("source") == "control_state"
+            and item.get("chapter") == chapter
+            and item.get("status", "detected") != "resolved"
+        ):
+            item["status"] = "resolved"
+            item["resolution"] = {
+                "kind": "superseded_by_clean_state_delta",
+                "previous_source_sha256": item.get("source_sha256"),
+                "validated_source_sha256": source_sha256,
+            }
+            changed = True
+    if changed:
+        path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path
 
 

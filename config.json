@@ -4,32 +4,40 @@
     "api_key_env": "ARK_API_KEY",
     "ark_request_timeout_seconds": 90,
     "models": {
-      "writer": "gpt-5.6-terra",
-      "outline": "gpt-5.6-terra",
+      "writer": "gpt-5.5",
+      "outline": "gpt-5.5",
       "final_editor": "gpt-5.5",
       "reviewer": "glm-5-2-260617",
-      "state_delta": "glm-5-2-260617",
-      "cn_summary": "deepseek-v4-flash-260425",
-      "radar": "deepseek-v4-flash-260425",
-      "handoff": "deepseek-v4-flash-260425"
+      "state_delta": "gpt-5.5",
+      "cn_summary": "deepseek-v4-flash-ga-260731",
+      "radar": "deepseek-v4-flash-ga-260731",
+      "handoff": "deepseek-v4-flash-ga-260731"
     },
     "relay": {
       "wire_api": "responses",
       "role_wire_apis": {
         "writer": "chat_completions",
         "outline": "chat_completions",
-        "final_editor": "chat_completions"
+      "final_editor": "chat_completions",
+      "state_delta": "chat_completions"
       },
+      "stream_roles": ["writer", "outline", "state_delta"],
+      "stream_total_timeout_seconds": 300,
       "writer_fallback": {
         "model": "gpt-5.6-terra",
         "primary_max_attempts": 3,
         "primary_request_timeout_seconds": 150
       },
+      "planning_fallback": {
+        "model": "gpt-5.6-terra",
+        "request_max_attempts": 1,
+        "request_timeout_seconds": 75
+      },
       "headers": {
         "x-openai-actor-authorization": "local-image-extension"
       }
     },
-    "note": "writer/outline 用 gpt-5.6-terra；末尾 AI 检测与修复保留 gpt-5.5；reviewer 和 state_delta 用 glm；摘要、雷达用 DeepSeek。Terra 当前是中转可验证的生产路由。"
+      "note": "2026-10-20 实测：中继目录列出 7 个 gpt 模型，仅 gpt-5.5 与 gpt-5.6-terra 路由可达；gpt-5.6-sol / gpt-6.1-sol / gpt-6-astra / gpt-6-sol 均返回 502 upstream_error（目录里有、上游通道被拒），故 writer/outline 及两者 fallback 只能在这两个可达模型间分配。旧注释曾称 gpt-6.1-sol 是已验证的 writer fallback，但历史 writer 记录为 9 成功 / 24 失败，该说法不成立。正文、末尾 AI 检测、修复和 state_delta 使用 gpt-5.5 流式中继；reviewer、摘要和雷达保留 Ark。"
   },
   "writing": {
     "default_chapters": 12,
@@ -40,6 +48,9 @@
     "serial_mode": true,
     "parallel_blocks": 2,
     "segment_words": 500,
+    "segment_max_tokens": 1200,
+    "segment_request_timeout_seconds": 75,
+    "segment_request_attempts": 1,
     "segment_cooldown": 1,
     "segment_recovery_attempts": 1,
     "segment_recovery_wait_seconds": 20,

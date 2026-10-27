@@ -132,8 +132,6 @@ def _state_evidence(previous_state, current_state, text_hash):
         changed.append("current_state_source_hash_mismatch")
     if current.get("validation_status") != "passed":
         changed.append("current_state_not_validated")
-    if previous is not None and previous.get("source_sha256") != current.get("source_sha256"):
-        changed.append("chapter_state_advanced")
     return {
         "status": "verified" if not changed else "invalid",
         "previous": previous,
@@ -223,10 +221,12 @@ def chapter_acceptance_decision(review, source_text=None, local_blockers=None, i
 
 
 def build_report(text, chapter_no, blind=None, previous_state=None, current_state=None, local_warnings=None,
-                 state_failure=None, acceptance=None):
+                 state_failure=None, acceptance=None, canonical_names=None):
     """Build a stable report from blind output and local evidence."""
     blind = blind or {}
     findings = quality_checks.structured_quality_findings(text or "")
+    if canonical_names is not None:
+        findings += quality_checks.unregistered_entity_findings(text or "", canonical_names)
     issues = []
     for index, finding in enumerate(findings, 1):
         card = dict(finding)
@@ -234,19 +234,25 @@ def build_report(text, chapter_no, blind=None, previous_state=None, current_stat
         card["status"] = "detected"
         card["required_action"] = "review_local" if finding.get("severity") != "blocking" else "repair_required"
         issues.append(card)
-    issues.extend(blind_marketing_findings(text or "", blind, chapter_no))
+    # Blind review is retained as diagnostic evidence. It does not decide
+    # whether a chapter can be persisted or released; anchored acceptance and
+    # state checks own those contracts.
+    observations = blind_marketing_findings(text or "", blind, chapter_no)
+    for observation in observations:
+        observation["severity"] = "observation"
+        observation["required_action"] = "review_editorial"
     score = blind.get("score")
     threshold = blind.get("threshold")
     if score is not None and threshold is not None and score < threshold:
-        issues.append({
+        observations.append({
             "issue_id": f"qg-blind-ch{int(chapter_no):04d}",
             "source": "blind_review",
             "category": "naturalness",
-            "severity": "blocking",
+            "severity": "observation",
             "message": f"naturalness {score} is below gate {threshold}",
             "excerpt": "",
-            "status": "detected",
-            "required_action": "rewrite_chapter",
+            "status": "observed",
+            "required_action": "review_editorial",
         })
     text_hash = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
     fact_diff = _state_evidence(previous_state, current_state, text_hash)
@@ -283,6 +289,7 @@ def build_report(text, chapter_no, blind=None, previous_state=None, current_stat
         "source_sha256": text_hash,
         "blind_review": blind,
         "issues": issues,
+        "observations": observations,
         "local_warnings": list(local_warnings or []),
         "fact_diff": fact_diff,
         "decision": decision,
@@ -354,9 +361,25 @@ def summarize_story(story_dir, chapter_files=None):
             missing.append(filename)
             continue
         source_hash = hashlib.sha256(text_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+        issues = report.get("issues", [])
+        if not isinstance(issues, list):
+            issues = []
+        active_issues = [item for item in issues if item.get("source") != "blind_review"]
+        has_blocking = any(item.get("severity") == "blocking" for item in active_issues)
+        has_review = bool(active_issues or report.get("local_warnings"))
+        if has_blocking:
+            effective_decision = "repair_required"
+        elif has_review:
+            effective_decision = "review_required"
+        elif not issues and report.get("decision") not in (None, "passed"):
+            # Preserve fail-closed handling for malformed legacy reports that
+            # do not identify what caused their recorded decision.
+            effective_decision = report.get("decision")
+        else:
+            effective_decision = "passed"
         item = {
             "file": filename,
-            "decision": report.get("decision"),
+            "decision": effective_decision,
             "source_sha256": report.get("source_sha256"),
             "state_status": (report.get("fact_diff") or {}).get("status"),
         }

@@ -1,8 +1,9 @@
 import unittest
 import json
+import shutil
 
 from control_checks import (
-    check_prose_budget, check_state_delta, manual_review_findings,
+    active_control_findings, append_control_findings, check_prose_budget, check_state_delta, manual_review_findings,
     parse_state_delta_output, validate_state_delta, write_state_delta,
 )
 from control_contracts import ControlContractError, sha256_text
@@ -29,6 +30,23 @@ def delta():
 
 
 class ControlStateChecksTests(unittest.TestCase):
+    def test_resolved_control_cards_are_retained_but_reopened_if_reobserved(self):
+        from pathlib import Path
+        root = Path(".control-card-test")
+        shutil.rmtree(root, ignore_errors=True)
+        try:
+            path = root / "control_findings.json"
+            finding = {"chapter": 1, "rule_id": "state", "message": "state failed", "source": "control_state"}
+            append_control_findings(path, [finding])
+            report = json.loads(path.read_text(encoding="utf-8"))
+            report["findings"][0]["status"] = "resolved"
+            path.write_text(json.dumps(report), encoding="utf-8")
+            self.assertEqual(active_control_findings(path), [])
+            append_control_findings(path, [finding])
+            self.assertEqual(len(active_control_findings(path)), 1)
+            self.assertEqual(active_control_findings(path)[0]["status"], "detected")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
     def test_valid_delta_matches_atomic_contract(self):
         item = delta()
         item["non_regression_statuses"][0]["evidence"] = "Mara reaches the ward."
@@ -84,12 +102,12 @@ class ControlStateChecksTests(unittest.TestCase):
         }, item,
                                      "Mara reaches the ward.", scenes)
         self.assertEqual({item["rule_id"] for item in findings}, {
-            "scene-not-once", "fact-evidence-value-not-found", "fact-value-conflict",
+            "scene-not-once", "fact-value-conflict",
         })
         scene_finding = next(item for item in findings if item["rule_id"] == "scene-not-once")
         self.assertEqual(scene_finding["evidence"], "Mara reaches the ward.")
 
-    def test_fact_status_must_prove_the_reported_value_in_its_quote(self):
+    def test_fact_status_allows_natural_language_evidence_for_a_canonical_summary(self):
         item = delta()
         item["non_regression_statuses"][0]["evidence"] = "Mara reaches the ward."
         item["scene_statuses"] = [{
@@ -98,7 +116,7 @@ class ControlStateChecksTests(unittest.TestCase):
         }]
         item["fact_statuses"] = [{
             "fact_id": "sample-count", "status": "consistent", "value": "twelve",
-            "evidence": "Mara catalogued six samples.",
+            "evidence": "Mara sealed the final sample in its twelfth vial.",
         }]
         scenes = [{
             "scene_id": "lab", "fact_slots": [{
@@ -108,11 +126,38 @@ class ControlStateChecksTests(unittest.TestCase):
         findings = check_state_delta({
             "end_assertions": [{"id": "mara-reaches-ward", "claim": "Mara reaches the ward.", "required": True}],
             "must_not_regress": [{"id": "ward-danger", "claim": "Mara knows the ward is dangerous.", "evidence_requirement": "Mara avoids the ward."}],
-        }, item, "Mara reaches the ward. Mara catalogued six samples.", scenes)
-        self.assertEqual([entry["rule_id"] for entry in findings], ["fact-evidence-value-not-found"])
-        self.assertEqual(findings[0]["expected_value"], "twelve")
-        self.assertEqual(findings[0]["observed_value"], "twelve")
-        self.assertEqual(findings[0]["evidence"], "Mara catalogued six samples.")
+        }, item, "Mara reaches the ward. Mara sealed the final sample in its twelfth vial.", scenes)
+        self.assertEqual(findings, [])
+
+    def test_story_bible_fact_slot_requires_a_semantic_state_result(self):
+        item = delta()
+        item["non_regression_statuses"][0]["evidence"] = "Mara reaches the ward."
+        item["fact_statuses"] = [{
+            "fact_id": "story-bible--sample-count", "status": "contradicted", "value": "six",
+            "evidence": "Mara catalogued six samples.",
+        }]
+        findings = check_state_delta(
+            {"end_assertions": [{"id": "mara-reaches-ward", "claim": "Mara reaches the ward.", "required": True}],
+             "must_not_regress": [{"id": "ward-danger", "claim": "Mara knows the ward is dangerous.", "evidence_requirement": "Mara avoids the ward."}]},
+            item, "Mara reaches the ward. Mara catalogued six samples.", [],
+            [{"id": "story-bible--sample-count", "claim": "Canon sample count", "value": "twelve"}],
+        )
+        self.assertEqual([entry["rule_id"] for entry in findings], ["fact-value-conflict"])
+
+    def test_story_bible_context_may_be_unclear_without_becoming_a_conflict(self):
+        item = delta()
+        item["non_regression_statuses"][0]["evidence"] = "Mara reaches the ward."
+        item["fact_statuses"] = [{
+            "fact_id": "story-bible--sample-count", "status": "unclear", "value": "twelve",
+            "evidence": "Mara reaches the ward.",
+        }]
+        findings = check_state_delta(
+            {"end_assertions": [{"id": "mara-reaches-ward", "claim": "Mara reaches the ward.", "required": True}],
+             "must_not_regress": [{"id": "ward-danger", "claim": "Mara knows the ward is dangerous.", "evidence_requirement": "Mara avoids the ward."}]},
+            item, "Mara reaches the ward.", [],
+            [{"id": "story-bible--sample-count", "claim": "Canon sample count", "value": "twelve"}],
+        )
+        self.assertEqual(findings, [])
 
     def test_failed_or_unclear_status_also_requires_verbatim_evidence(self):
         item = delta()
@@ -196,10 +241,30 @@ class ControlStateChecksTests(unittest.TestCase):
         self.assertFalse(fake.calls[0][4])
         prompt = fake.calls[0][1][1]["content"]
         self.assertIn("do not add quotation marks", prompt)
-        self.assertIn("Set new_information, relationship_changes, open_hooks, and conflicts_with_contract to [] exactly", prompt)
+        self.assertIn("one short unresolved open hook", prompt)
         self.assertIn("scene_statuses must contain every supplied scene_id", prompt)
         self.assertIn("fact_statuses must contain every supplied fact slot", prompt)
         self.assertIn("never use fact_slot_id", prompt)
+
+    def test_state_delta_budget_grows_for_story_bible_fact_slots(self):
+        engine = object.__new__(WritingEngine)
+        engine.llm = __import__("unittest").mock.Mock()
+        engine.llm.chat.return_value = {"content": "{}"}
+        engine.generate_state_delta("Mara reaches the ward.", 2, {
+            "end_assertions": [], "must_not_regress": [],
+        }, (), [{"id": f"story-bible--fact-{index}", "claim": "Canon", "value": "fixed"} for index in range(11)])
+        self.assertEqual(engine.llm.chat.call_args.kwargs["max_tokens"], 1680)
+
+    def test_state_delta_correction_requires_literal_evidence(self):
+        engine = object.__new__(WritingEngine)
+        engine.llm = __import__("unittest").mock.Mock()
+        engine.llm.chat.return_value = {"content": "{}"}
+        engine.generate_state_delta("Mara reaches the ward.", 2, {
+            "end_assertions": [], "must_not_regress": [],
+        }, correction="Evidence for fact slot ward is not a verbatim chapter quotation.")
+        prompt = engine.llm.chat.call_args.args[1][1]["content"]
+        self.assertIn("previous state JSON was rejected", prompt)
+        self.assertIn("exact contiguous substring", prompt)
 
     def test_budget_is_local_and_manual_categories_never_auto_pass(self):
         findings, counts, totals = check_prose_budget(
@@ -214,6 +279,16 @@ class ControlStateChecksTests(unittest.TestCase):
         manual = manual_review_findings(1, [{"scene_id": "s1"}], [{"name": "Mara"}], {"visible_loss": "lab"})
         self.assertEqual({item["category"] for item in manual}, {"opening", "scene", "voice"})
         self.assertTrue(all(item["severity"] == "manual_review_required" for item in manual))
+
+    def test_declared_contract_fact_without_a_scene_slot_blocks_state_validation(self):
+        item = delta()
+        item["non_regression_statuses"][0]["evidence"] = "Mara reaches the ward."
+        findings = check_state_delta({
+            "end_assertions": [{"id": "mara-reaches-ward", "claim": "Mara reaches the ward.", "required": True}],
+            "must_not_regress": [{"id": "ward-danger", "claim": "Mara knows the ward is dangerous.", "evidence_requirement": "Mara avoids the ward."}],
+            "facts": [{"id": "sample-count", "claim": "Sample count", "value": "twelve"}],
+        }, item, "Mara reaches the ward.", [{"scene_id": "lab", "fact_slots": []}])
+        self.assertIn("fact-slot-not-covered", [entry["rule_id"] for entry in findings])
 
 
 if __name__ == "__main__":

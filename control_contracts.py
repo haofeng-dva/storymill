@@ -11,10 +11,16 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = "controlled_generation_v2"
-MAX_CONTEXT_BYTES = 2048
-# Compilation needs headroom for the bounded actual-state handoff that is only
-# available after the preceding chapter has been written.
-MAX_COMPILED_CONTEXT_BYTES = 1700
+# This limit applies to both compile-time preflight and the runtime writer.
+# Keeping one value prevents a validated bundle from failing later only after
+# several chapters have already been written.
+#
+# The value must cover the *worst legal* prior-state projection, not the size of
+# a typical chapter: two new-information strings plus two consistent facts, each
+# capped at MAX_PRIOR_FACT_CHARS.  With the current 12-chapter bundle that is
+# 4647 bytes at chapter 8 (the largest contract), so 4800 leaves ~150 bytes of
+# headroom while still refusing genuinely oversized control blocks.
+MAX_CONTEXT_BYTES = 4800
 CONTROL_FILENAMES = {
     "chapter_contracts": "chapter_contracts.json",
     "scene_ledger": "scene_ledger.json",
@@ -147,10 +153,13 @@ def validate_chapter_contracts(document, expected_story_id=None, expected_source
         for index, fact in enumerate(facts):
             if not isinstance(fact, dict):
                 raise ControlContractError(f"chapters.{key}.facts[{index}] must be an object")
-            fact_id = _require_nonempty_string(fact.get("id"), f"chapters.{key}.facts[{index}].id")
+            prefix = f"chapters.{key}.facts[{index}]"
+            fact_id = _require_nonempty_string(fact.get("id"), f"{prefix}.id")
             if fact_id in fact_ids:
                 raise ControlContractError(f"duplicate fact id {fact_id!r}")
             fact_ids.add(fact_id)
+            _require_nonempty_string(fact.get("claim"), f"{prefix}.claim")
+            _require_discrete_fact_value(fact.get("value"), f"{prefix}.value")
     return document
 
 
@@ -277,10 +286,17 @@ VALIDATORS = {
 
 
 def validate_cross_artifact_references(artifacts):
-    """Reject bundles whose scene participants cannot resolve to a voice card."""
+    """Reject bundles with unresolved people or facts.
+
+    A chapter fact is not advisory prose: the same id, claim, and canonical
+    value must appear in a scene slot for that chapter.  This prevents the
+    state checker from receiving an empty fact list while a separate contract
+    merely names the fact.
+    """
     try:
         cards = artifacts["character_voice_cards"]["characters"]
         chapters = artifacts["scene_ledger"]["chapters"]
+        contracts = artifacts["chapter_contracts"]["chapters"]
     except (KeyError, TypeError) as exc:
         raise ControlContractError("missing artifacts for cross-reference validation") from exc
     names = {card["name"].casefold() for card in cards}
@@ -292,6 +308,41 @@ def validate_cross_artifact_references(artifacts):
         raise ControlContractError(
             "scene participants must exactly match character voice-card names: " + ", ".join(missing)
         )
+    for key, contract in contracts.items():
+        slots = {
+            item["id"]: (item["claim"], item["value"])
+            for scene in chapters.get(key, [])
+            for item in scene["fact_slots"]
+        }
+        facts = {
+            item["id"]: (item["claim"], item["value"])
+            for item in contract["facts"]
+        }
+        for fact in contract["facts"]:
+            actual = slots.get(fact["id"])
+            expected = (fact["claim"], fact["value"])
+            if actual is None:
+                raise ControlContractError(
+                    f"chapter {key} fact {fact['id']!r} is not covered by any scene fact slot"
+                )
+            if actual != expected:
+                raise ControlContractError(
+                    f"chapter {key} fact {fact['id']!r} does not match its scene fact slot"
+                )
+        # The writer and state checker consume scene slots, while final review
+        # consumes chapter facts.  One-way validation leaves one of those
+        # consumers with an empty canon, so every executable slot must also be
+        # declared by the chapter contract with the identical literal value.
+        for fact_id, actual in slots.items():
+            expected = facts.get(fact_id)
+            if expected is None:
+                raise ControlContractError(
+                    f"chapter {key} scene fact slot {fact_id!r} is not declared by its chapter contract"
+                )
+            if expected != actual:
+                raise ControlContractError(
+                    f"chapter {key} scene fact slot {fact_id!r} does not match its chapter contract"
+                )
     return artifacts
 
 

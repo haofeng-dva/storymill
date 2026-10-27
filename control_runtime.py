@@ -8,10 +8,13 @@ from control_checks import (
     check_prose_budget,
     evaluate_state_delta_output,
     manual_review_findings,
+    resolve_control_state_findings,
     write_state_delta,
 )
 from control_context import build_control_context, load_state_delta
 from control_contracts import ControlContractError, sha256_text
+from chapter_state import FailureType, classify_failure
+from quality_checks import unregistered_entity_findings
 
 
 class ControlledGenerationRuntime:
@@ -24,6 +27,12 @@ class ControlledGenerationRuntime:
         self.bundle = bundle
         self.artifacts = bundle["artifacts"]
         self.book_counts = {}
+        self.total_chapters = len(self.artifacts["chapter_contracts"]["chapters"])
+        # The engine can make one narrowly scoped re-check when the reviewer
+        # returns malformed evidence. Keep this reason separate from the
+        # durable finding cards, which remain the audit record.
+        self.last_state_failure = ""
+        self.last_state_failure_type = FailureType.QUALITY.value
 
     @property
     def findings_path(self):
@@ -38,35 +47,65 @@ class ControlledGenerationRuntime:
             )
         return result
 
-    def record_state_delta(self, chapter_no, text, response):
+    def record_state_delta(self, chapter_no, text, response, additional_fact_slots=()):
         """Persist one validated delta; return False only for a blocking state failure."""
         source_sha256 = sha256_text(text)
         contract = self.artifacts["chapter_contracts"]["chapters"].get(f"{chapter_no:04d}")
         scenes = self.scenes_for(chapter_no)
         if not contract:
+            self.last_state_failure = "No control contract for chapter."
+            self.last_state_failure_type = FailureType.QUALITY.value
             self._append_state_failure(chapter_no, "missing-chapter-contract", "No control contract for chapter.", source_sha256)
             return False
         if "error" in response:
+            self.last_state_failure = response["error"]
+            self.last_state_failure_type = classify_failure(response["error"])
             self._append_state_failure(chapter_no, "state-delta-generation-failed", response["error"], source_sha256)
             return False
         try:
             delta, findings = evaluate_state_delta_output(
-                response.get("content", ""), chapter_no, source_sha256, contract, text, scenes
+                response.get("content", ""), chapter_no, source_sha256, contract, text, scenes,
+                additional_fact_slots,
             )
+            # A serial chapter needs one explicit unresolved pursuit to hand
+            # forward.  The final chapter is exempt because it is expected to
+            # close the book rather than manufacture a sequel hook.
+            if chapter_no < self.total_chapters and not delta.get("open_hooks"):
+                findings.append({
+                    "chapter": chapter_no,
+                    "rule_id": "missing-open-hook",
+                    "root_cause_key": "missing-open-hook",
+                    "category": "continuity",
+                    "severity": "blocking",
+                    "message": "A non-final chapter must hand forward at least one unresolved hook.",
+                })
             write_state_delta(self.control_dir, delta, findings)
         except ControlContractError as exc:
+            self.last_state_failure = str(exc)
+            self.last_state_failure_type = FailureType.QUALITY.value
             self._append_state_failure(chapter_no, "invalid-state-delta", str(exc), source_sha256)
             return False
         if findings:
             self._append_findings(chapter_no, text, findings)
-            return not any(item.get("severity") == "blocking" for item in findings)
+            blocking = any(item.get("severity") == "blocking" for item in findings)
+            self.last_state_failure = "; ".join(
+                item.get("message", item.get("rule_id", "state validation failed"))
+                for item in findings if item.get("severity") == "blocking"
+            )
+            self.last_state_failure_type = FailureType.QUALITY.value
+            if not blocking:
+                resolve_control_state_findings(self.findings_path, chapter_no, source_sha256)
+            return not blocking
+        self.last_state_failure = ""
+        self.last_state_failure_type = None
+        resolve_control_state_findings(self.findings_path, chapter_no, source_sha256)
         return True
 
     def scenes_for(self, chapter_no):
         return self.artifacts["scene_ledger"]["chapters"].get(f"{chapter_no:04d}", [])
 
     def post_write_findings(self, chapter_no, text):
-        """Write deterministic and manual-review cards, returning blocking budget findings."""
+        """Write deterministic cards and return every locally blocking finding."""
         key = f"{chapter_no:04d}"
         scenes = self.artifacts["scene_ledger"]["chapters"][key]
         participants = {name for scene in scenes for name in scene["participants"]}
@@ -77,12 +116,16 @@ class ControlledGenerationRuntime:
         budget_findings, _, self.book_counts = check_prose_budget(
             text, self.artifacts["prose_budget"], chapter_no, self.book_counts
         )
+        entity_findings = unregistered_entity_findings(
+            text, [card["name"] for card in self.artifacts["character_voice_cards"]["characters"]]
+        )
         manual_findings = manual_review_findings(
             chapter_no, scenes, voice_cards,
             self.artifacts["opening_contract"] if chapter_no == 1 else None,
         )
-        self._append_findings(chapter_no, text, manual_findings + budget_findings)
-        return budget_findings
+        blocking_findings = budget_findings + entity_findings
+        self._append_findings(chapter_no, text, manual_findings + blocking_findings)
+        return blocking_findings
 
     def _append_findings(self, chapter_no, text, findings):
         """Attach immutable source provenance before a card reaches repair routing."""
@@ -118,6 +161,8 @@ class ControlledGenerationRuntime:
         card = next((item for item in findings if item.get("card_id") == card_id), None)
         if card is None:
             raise ControlContractError(f"unknown control repair card: {card_id}")
+        if card.get("status", "detected") == "resolved":
+            raise ControlContractError(f"control repair card is already resolved: {card_id}")
         if card.get("story_id") != self.story_id:
             raise ControlContractError(f"repair card story_id does not match current story: {card_id}")
         chapter_no = card.get("chapter")

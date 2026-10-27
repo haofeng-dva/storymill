@@ -32,7 +32,10 @@ from state_store import StateStore
 import quality_checks
 import quality_gate
 from distill.experience_runtime import ExperienceRuntime
-from chapter_state import ChapterStatus, FailureType, classify_failure, is_auto_retryable
+from chapter_state import (
+    ChapterStatus, FailureType, classify_failure, is_auto_retryable,
+    is_infrastructure_failure, is_transient_infrastructure_failure,
+)
 from chapter_tasks import ChapterTaskStore
 from writing_status import write_status
 from book_memory import BookMemory
@@ -42,12 +45,18 @@ from chapter_contract import (
     planning_hash as chapter_contract_planning_hash, requirements_for_chapter,
     writer_contract_block,
 )
-from control_context import build_control_context, load_state_delta
+from control_context import build_control_context, build_repair_context, load_state_delta
 from control_contracts import (
     ControlContractError, acceptance_requirements_for_chapter, load_control_bundle,
     sha256_text, source_hash,
 )
 from control_runtime import ControlledGenerationRuntime
+from story_bible import (
+    StoryBibleError, chapter_outline_section, story_bible_foundation, commit_chapter_plan, load_story_bible,
+    is_runtime_state_fact, make_story_bible, normalize_plan_canon_references, normalize_new_entry_source_quotes, planning_source, planning_hash as story_bible_planning_hash, render_chapter_packet,
+    rollback_chapter_plan, save_story_bible, validate_chapter_plan,
+)
+from story_bible_checks import audit_chapter_facts, planned_fact_slots
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -72,6 +81,65 @@ def serial_recovery_start(missing, rows, predecessor_available):
     return None
 
 
+def final_run_status(missing, rows):
+    """Keep provider outages distinct from content failures in the run ledger."""
+    if not missing:
+        return "completed"
+    failed = [row for row in rows.values() if row.get("status") == ChapterStatus.FAILED.value]
+    if failed and all(is_infrastructure_failure(row.get("failure_type")) for row in failed):
+        return "failed_infra"
+    return "partial"
+
+
+def acceptance_failure_type(review, failure):
+    """Keep a multi-provider outage from being mislabeled as its final fallback."""
+    provider_failures = review.get("provider_failures") if isinstance(review, dict) else None
+    failure_types = [
+        item.get("failure_type") for item in provider_failures
+        if isinstance(item, dict) and item.get("failure_type")
+    ] if isinstance(provider_failures, list) else []
+    if (
+        isinstance(provider_failures, list)
+        and provider_failures
+        and len(failure_types) == len(provider_failures)
+        and all(is_infrastructure_failure(failure_type) for failure_type in failure_types)
+    ):
+        return FailureType.ACCEPTANCE_INFRASTRUCTURE.value
+    return classify_failure(failure)
+
+
+def acceptance_failure_summary(review):
+    """Return a compact, ordered provider diagnosis for the production log."""
+    provider_failures = review.get("provider_failures") if isinstance(review, dict) else None
+    if not isinstance(provider_failures, list):
+        return ""
+    summary = []
+    for item in provider_failures:
+        if not isinstance(item, dict):
+            continue
+        provider = item.get("provider") or "unknown"
+        model = item.get("model") or "unknown"
+        failure_type = item.get("failure_type") or "unknown"
+        summary.append(f"{provider}/{model}={failure_type}")
+    return "; ".join(summary)
+
+
+def initial_recovery_handoff(control_bundle, previous_text, chapter_no, handoff_for):
+    """Build textual recovery context only when the run does not use state deltas."""
+    if control_bundle or not previous_text:
+        return ""
+    return handoff_for(previous_text, chapter_no)
+
+
+def configure_runtime_streams(stdout=None, stderr=None):
+    """Flush each progress line when a launcher redirects engine output."""
+    streams = (sys.stdout if stdout is None else stdout, sys.stderr if stderr is None else stderr)
+    for stream in streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(line_buffering=True)
+
+
 def build_argument_parser():
     """Create the CLI parser without starting a production run."""
     ap = argparse.ArgumentParser(description="InkOS 替代：英文写作引擎")
@@ -82,6 +150,8 @@ def build_argument_parser():
     ap.add_argument("--story-id", default="test")
     ap.add_argument("--genre", default=None, help="题材目录名：domestic_suspense / webfiction / literary；不填则从 direction 自动检测")
     ap.add_argument("--outline-only", action="store_true", help="只出大纲，不写正文")
+    ap.add_argument("--planning-only", action="store_true",
+                    help="生成并保存大纲和世界观，不编译控制合同或写正文")
     ap.add_argument("--chapter", type=int, default=0, help="只写指定章（0=全部）")
     ap.add_argument("--extra-rules", default="", help="额外写作规则（从盲评迭代回灌），追加注入写章 prompt")
     ap.add_argument("--no-experiences", action="store_true", help="本次运行不读取蒸馏经验包，保留原写作提示")
@@ -94,6 +164,10 @@ def build_argument_parser():
     ap.add_argument("--run-id", default="", help="运行 ID，用于章节状态审计")
     ap.add_argument("--writer-model", default="", help="仅覆盖本次运行的正文模型；不修改 config.json")
     ap.add_argument("--outline-model", default="", help="仅覆盖本次运行的大纲/设定模型；不修改 config.json")
+    ap.add_argument("--segment-words", type=int, default=None,
+                    help="仅覆盖本次中转写章分段字数；不修改 config.json")
+    ap.add_argument("--segment-request-timeout", type=int, default=None,
+                    help="仅覆盖本次单段中转超时秒数；不修改 config.json")
     ap.add_argument("--resume", action="store_true", help="恢复指定 --run-id，跳过已完成章节")
     ap.add_argument("--append-chapters", type=int, default=0,
                     help="在已有故事末尾追加章节；12章只是试写批次，不代表全书结束")
@@ -106,6 +180,8 @@ def build_argument_parser():
                     help="仅校验受控生成输入和每章上下文，不调用正文模型")
     ap.add_argument("--control-fail-on", default="", help="预留：逗号分隔的控制失败类别")
     ap.add_argument("--control-repair-card", default="", help="预留：仅处理指定控制失败卡")
+    ap.add_argument("--story-bible", action="store_true",
+                    help="启用只读设定库：逐章计划先校验既定人物与事实，再写正文")
     ap.add_argument("--assemble-only", action="store_true", help="仅从已完成章节重建 full.md，不调用模型")
     return ap
 
@@ -118,10 +194,15 @@ def option_compatibility_error(args):
 
 
 def should_reuse_planning_artifact(args, path):
-    """Controlled runs are bound to their compiled planning-input hash."""
+    """Planning-only runs resume their saved inputs without producing chapters."""
     return bool(
         os.path.exists(path)
-        and (args.resume or args.append_chapters or args.controlled_generation)
+        and (
+            args.resume
+            or args.append_chapters
+            or args.controlled_generation
+            or args.planning_only
+        )
     )
 
 
@@ -229,7 +310,7 @@ class LLM:
         self.chapter_no = None
         self._state = None
         self._local = threading.local()
-        self._writer_fallback_model = ""
+        self._fallback_models = {}
 
     def _relay_headers(self):
         headers = {"Content-Type": "application/json"}
@@ -253,13 +334,20 @@ class LLM:
             raise ValueError(f"unsupported relay wire API for {role}: {wire_api}")
         return wire_api
 
+    def _relay_stream_enabled(self, role):
+        """Whether this role needs chunked relay output to survive proxy idle limits."""
+        roles = self.relay_config.get("stream_roles", [])
+        if not isinstance(roles, list) or not all(isinstance(item, str) for item in roles):
+            raise ValueError("llm.relay.stream_roles must be a list of role names")
+        return role in roles
+
     def set_run_context(self, run_id, story_id, state_store=None, chapter_no=None):
         self.run_id = run_id or ""
         self.story_id = story_id or ""
         self.chapter_no = chapter_no
         self._local.chapter_no = chapter_no
         self._state = state_store
-        self._writer_fallback_model = ""
+        self._fallback_models = {}
 
     def set_chapter_context(self, chapter_no):
         self._local.chapter_no = chapter_no
@@ -449,7 +537,8 @@ class LLM:
         }
 
     def _chat_relay_completions(self, model, messages, max_tokens, temperature, started=None, json_mode=False,
-                                max_attempts=5, request_timeout=300):
+                                max_attempts=5, request_timeout=300, stream=False,
+                                stream_total_timeout=300):
         """Compatibility path for relays that require WebSocket on Responses but retain HTTP chat completions."""
         body = {
             "model": model,
@@ -459,6 +548,9 @@ class LLM:
         }
         if json_mode:
             body["response_format"] = {"type": "json_object"}
+        if stream:
+            body["stream"] = True
+            body["stream_options"] = {"include_usage": True}
         req = urllib.request.Request(
             self.relay_base + "/v1/chat/completions",
             data=json.dumps(body).encode("utf-8"),
@@ -468,25 +560,105 @@ class LLM:
         retry_sleeps = (5, 15, 45, 90)
         max_attempts = max(1, min(int(max_attempts), 5))
         request_timeout = max(1, int(request_timeout))
+        stream_total_timeout = max(
+            request_timeout + 5, min(int(stream_total_timeout), 600)
+        )
         for attempt in range(max_attempts):
-            try:
-                with urllib.request.urlopen(req, timeout=request_timeout) as response:
-                    data = json.loads(response.read().decode("utf-8"))
-                break
-            except urllib.error.HTTPError as exc:
-                error_body = exc.read().decode("utf-8", "ignore")[:400]
-                # This relay intermittently returns a bare gateway page as a
-                # 404. Do not retry real API/model 404s such as model_not_found.
-                transient_gateway_404 = exc.code == 404 and error_body.strip().lower() == "404 page not found"
-                if (exc.code in retry_codes or transient_gateway_404) and attempt < max_attempts - 1:
-                    time.sleep(retry_sleeps[attempt])
-                    continue
-                return {"error": f"HTTP {exc.code}: {error_body}"}
-            except Exception as exc:
+            result = {}
+
+            def worker():
+                try:
+                    with urllib.request.urlopen(req, timeout=request_timeout) as response:
+                        if not stream:
+                            result["data"] = json.loads(response.read().decode("utf-8"))
+                            return
+                        content_parts = []
+                        usage = {}
+                        saw_terminal = False
+                        for raw_line in response:
+                            line = raw_line.decode("utf-8", "ignore").strip()
+                            if not line or line.startswith(":") or not line.startswith("data:"):
+                                continue
+                            payload = line[5:].strip()
+                            if payload == "[DONE]":
+                                saw_terminal = True
+                                break
+                            event = json.loads(payload)
+                            if isinstance(event.get("usage"), dict):
+                                usage = event["usage"]
+                            for choice in event.get("choices") or []:
+                                delta = choice.get("delta") or {}
+                                # Reasoning traces are not prose and must never enter the chapter.
+                                if isinstance(delta.get("content"), str):
+                                    content_parts.append(delta["content"])
+                                if choice.get("finish_reason"):
+                                    saw_terminal = True
+                        content = "".join(content_parts).strip()
+                        if not saw_terminal:
+                            # Prose must never be accepted from an abruptly
+                            # closed stream. Structured callers already ask
+                            # the relay for a JSON object, however, so a fully
+                            # parseable object is independent proof that the
+                            # response was not truncated when a relay omits
+                            # its final SSE marker.
+                            try:
+                                parsed = json.loads(content) if json_mode else None
+                            except (TypeError, ValueError, json.JSONDecodeError):
+                                parsed = None
+                            if not isinstance(parsed, dict):
+                                result["exception"] = (
+                                    "StreamInterruptedError",
+                                    "stream ended without a terminal event",
+                                )
+                                return
+                        if not content:
+                            result["exception"] = ("StreamProtocolError", "empty streamed content")
+                            return
+                        result["data"] = {
+                            "choices": [{"message": {"content": content}}],
+                            "usage": usage,
+                        }
+                except urllib.error.HTTPError as exc:
+                    result["http_error"] = (
+                        exc.code, exc.read().decode("utf-8", "ignore")[:400],
+                    )
+                except Exception as exc:
+                    result["exception"] = (type(exc).__name__, str(exc)[:200])
+
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+            thread.join(timeout=stream_total_timeout if stream else request_timeout + 5)
+            if thread.is_alive():
+                if stream:
+                    error = f"HTTP HANG: streamed chat completion exceeded {stream_total_timeout}s"
+                else:
+                    error = (
+                        f"HTTP HANG: chat completion request stuck >"
+                        f"{request_timeout + 5}s"
+                    )
                 if attempt < max_attempts - 1:
                     time.sleep(retry_sleeps[attempt])
                     continue
-                return {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+                return {"error": error}
+            if "http_error" in result:
+                code, error_body = result["http_error"]
+                # This relay intermittently returns a bare gateway page as a
+                # 404. Do not retry real API/model 404s such as model_not_found.
+                transient_gateway_404 = code == 404 and error_body.strip().lower() == "404 page not found"
+                if (code in retry_codes or transient_gateway_404) and attempt < max_attempts - 1:
+                    time.sleep(retry_sleeps[attempt])
+                    continue
+                return {"error": f"HTTP {code}: {error_body}"}
+            if "exception" in result:
+                name, message = result["exception"]
+                if attempt < max_attempts - 1:
+                    time.sleep(retry_sleeps[attempt])
+                    continue
+                return {"error": f"{name}: {message}"}
+            data = result.get("data")
+            if not isinstance(data, dict):
+                return {"error": "invalid chat completion response"}
+            break
         message = data["choices"][0]["message"]
         usage = data.get("usage", {})
         return {
@@ -506,6 +678,8 @@ class LLM:
                 return backend, self._chat_relay_completions(
                     model, messages, max_tokens, temperature, json_mode=json_mode,
                     max_attempts=relay_max_attempts, request_timeout=relay_request_timeout,
+                    stream=self._relay_stream_enabled(role),
+                    stream_total_timeout=self.relay_config.get("stream_total_timeout_seconds", 300),
                 )
             return backend, self._chat_relay(model, messages, max_tokens, temperature, json_mode=json_mode)
         return backend, self._chat_ark(model, messages, max_tokens, temperature, json_mode=json_mode)
@@ -524,16 +698,29 @@ class LLM:
             retry_index=getattr(self._local, "retry_index", None),
         )
 
-    def chat(self, role, messages, max_tokens=2000, temperature=0.85, json_mode=False):
+    def chat(self, role, messages, max_tokens=2000, temperature=0.85, json_mode=False,
+             relay_max_attempts=None, relay_request_timeout=None):
         configured_model = self.models[role]
         started = time.time()
-        fallback = self.relay_config.get("writer_fallback", {}) if role == "writer" else {}
+        fallback_key = {
+            "writer": "writer_fallback",
+            "outline": "planning_fallback",
+        }.get(role)
+        fallback = self.relay_config.get(fallback_key, {}) if fallback_key else {}
         fallback_model = fallback.get("model") if isinstance(fallback, dict) else ""
-        model = self._writer_fallback_model if role == "writer" and self._writer_fallback_model else configured_model
-        using_primary_writer = model == configured_model
+        model = self._fallback_models.get(role, configured_model)
+        using_primary_model = model == configured_model
         try:
-            retry_attempts = fallback.get("primary_max_attempts", 5) if fallback and using_primary_writer else 5
-            primary_timeout = fallback.get("primary_request_timeout_seconds", 300) if fallback and using_primary_writer else 300
+            if role == "outline" and fallback:
+                retry_attempts = fallback.get("request_max_attempts", 1)
+                primary_timeout = fallback.get("request_timeout_seconds", 75)
+            else:
+                retry_attempts = fallback.get("primary_max_attempts", 5) if fallback and using_primary_model else 5
+                primary_timeout = fallback.get("primary_request_timeout_seconds", 300) if fallback and using_primary_model else 300
+            if relay_max_attempts is not None:
+                retry_attempts = relay_max_attempts
+            if relay_request_timeout is not None:
+                primary_timeout = relay_request_timeout
             backend, result = self._call_model(
                 role, model, messages, max_tokens, temperature, json_mode=json_mode,
                 relay_max_attempts=retry_attempts, relay_request_timeout=primary_timeout,
@@ -545,15 +732,17 @@ class LLM:
             result = {**result, "error": "model returned empty output", "failure_type": FailureType.EMPTY_OUTPUT.value}
         if "error" in result:
             result.setdefault("failure_type", classify_failure(result.get("error")))
-        if "error" in result and using_primary_writer and fallback_model and fallback_model != model:
+        if "error" in result and using_primary_model and fallback_model and fallback_model != model:
             self._record_call(role, model, backend, result, started)
-            # A relay failure is a run-level condition, not a single-segment
-            # condition. Do not spend two failing primary attempts per segment.
-            self._writer_fallback_model = fallback_model
+            # A relay failure is role-wide for this run. Do not spend another
+            # failing primary attempt on a later writer or planning segment.
+            self._fallback_models[role] = fallback_model
             fallback_started = time.time()
             try:
                 fallback_backend, fallback_result = self._call_model(
                     role, fallback_model, messages, max_tokens, temperature, json_mode=json_mode,
+                    relay_max_attempts=retry_attempts,
+                    relay_request_timeout=primary_timeout,
                 )
             except Exception as exc:
                 fallback_backend = get_writer_profile(fallback_model)["backend"]
@@ -677,10 +866,15 @@ class WritingEngine:
             f"Target: {self.w['default_chapters']} chapters, {self.w['default_words']} words each.\n\n"
             "Output a concise outline with:\n"
             "1. Logline (one sentence)\n"
-            "2. Protagonist (name, flaw, want)\n"
+            "2. Story canon: every recurring character's final full name and unique role; every plot-critical "
+            "case number, time span, relationship, identity, rule, object, or location must have one literal value. "
+            "Never leave a core fact as a placeholder or give variants.\n"
+            "3. Protagonist (name, flaw, want)\n"
             + structure + "\n"
             "4. Chapter-by-chapter beats. For EACH chapter, specify 2-3 scene beats, "
-            "including at least one dialogue exchange AND one concrete detail or revelation. "
+            "including at least one dialogue exchange AND one concrete detail or revelation. For every chapter state: "
+            "the pressure/conflict, the protagonist's choice, the irreversible result, the relationship or emotional "
+            "turn, and which hook opens or closes. "
             "Each chapter's beats must be substantial enough to sustain ~" + str(self.w['default_words']) + " words of prose without padding or repetition. "
             "Give the middle chapters rising complications, not filler. "
             "Avoid clichéd story skeletons (e.g. late-night phone call -> accident -> calm spouse -> immediate clue-hunting). "
@@ -713,6 +907,9 @@ class WritingEngine:
                 f"Story direction: {direction}\n\n"
                 "Write the story foundation (under 220 words):\n"
                 "1. Logline (one sentence)\n2. Protagonist (name, flaw, want)\n"
+                "3. Story canon: list every recurring character by final full name and unique role; list each "
+                "plot-critical literal fact (identity, relationship, time span, case/code, object, rule, or location) "
+                "with exactly one value. Never give aliases, variants, or placeholders.\n"
                 + structure + "\n"
                 "Output only this part, no commentary."
             )},
@@ -730,6 +927,8 @@ class WritingEngine:
                     "Story foundation:\n" + foundation["content"] + "\n\n"
                     f"Write chapter-by-chapter beats only for chapters {start}-{end} (under 220 words). "
                     "For EACH chapter: 2-3 scene beats, at least one dialogue exchange, and one concrete detail or revelation. "
+                    "For EACH chapter also state pressure, protagonist choice, irreversible result, relationship/emotional turn, "
+                    "and a named hook opened or closed. Reuse story-canon names and literal values exactly; do not add aliases. "
                     f"Each chapter's beats must sustain ~{self.w['default_words']} words of prose. "
                     "Preserve escalation across the stated chapter range. Output only these beats."
                 )},
@@ -752,7 +951,8 @@ class WritingEngine:
             {"role": "user", "content": (
                 f"Story direction: {direction}\n\nOutline:\n{outline}\n\n"
                 "Create world-bible part 1 (under 220 words): the premise-specific world rules and the protagonist plus key cast. "
-                "For every character give name, flaw, want, and role. Preserve only facts grounded in the outline."
+                "For every character give the exact canonical full name, flaw, want, role, and relationship boundary. "
+                "Preserve each literal canon value from the outline exactly; do not introduce aliases or alternate facts."
             )},
         ], max_tokens=600, temperature=0.7)
         if "error" in core:
@@ -763,7 +963,7 @@ class WritingEngine:
                 f"Story direction: {direction}\n\nOutline:\n{outline}\n\n"
                 "World-bible part 1:\n" + core["content"] + "\n\n"
                 "Create world-bible part 2 (under 180 words): recurring locations, objects, relationship boundaries, and continuity rules. "
-                "Do not invent a new plotline. Output only this part."
+                "State each rule as one unambiguous value the writer can reuse verbatim. Do not invent a new plotline. Output only this part."
             )},
         ], max_tokens=600, temperature=0.7)
         if "error" in support:
@@ -772,6 +972,129 @@ class WritingEngine:
             "content": core["content"].strip() + "\n\n" + support["content"].strip(),
             "elapsed": round(core.get("elapsed", 0) + support.get("elapsed", 0), 1),
         }
+
+    @staticmethod
+    def _story_bible_json(content, label, keys):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", (content or "").strip(), flags=re.I)
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise StoryBibleError(f"{label} did not return valid JSON: {exc}") from exc
+        if not isinstance(payload, dict) or set(payload) != set(keys):
+            raise StoryBibleError(f"{label} must contain exactly: {', '.join(keys)}")
+        return payload
+
+    def compile_story_bible(self, direction, outline, world_bible, story_id):
+        """Extract anchored literal canon once; local validation owns acceptance."""
+        foundation = story_bible_foundation(outline)
+        canon_source = planning_source(direction, foundation, world_bible)
+        prompt = """Return one JSON object only with exactly: entities, facts.
+This is a literal story bible, not a prose summary. Every entity is {id,name,aliases,source_quote}.
+Every fact is {id,subject_id,field,value,source_quote}. Use lowercase hyphenated ids.
+Only include fixed, concrete facts later chapters must not change: names, identities, family
+relationships, dates or durations, codes, object ownership, locations, and explicit world rules. Do NOT
+include mutable story state such as a character's current role, rank, office, command, title, or status;
+those are carried chapter to chapter by validated state, because the plot may formally change them.
+Each source_quote must be copied character-for-character from the supplied planning inputs and must
+contain the exact entity name or fact value it supports. Do not normalize names, infer, explain, or invent.
+Each (subject_id, field) pair must appear only once; make fields specific when one subject has multiple rules.
+
+Story direction:
+""" + direction + "\n\nFixed setup before Chapter One:\n" + foundation + "\n\nWorld bible:\n" + world_bible
+        correction = ""
+        last_error = ""
+        for attempt in range(1, 4):
+            response = self.llm.chat("outline", [
+                {"role": "system", "content": "You extract literal canon for a serialized-fiction planner. Return strict JSON only."},
+                {"role": "user", "content": prompt + correction},
+            ], max_tokens=2400, temperature=0, json_mode=True)
+            if "error" in response:
+                return response
+            try:
+                payload = self._story_bible_json(response.get("content"), "story bible compiler", ("entities", "facts"))
+                return {"content": make_story_bible(
+                    story_id, direction, outline, world_bible, payload, canon_source=canon_source,
+                )}
+            except StoryBibleError as exc:
+                last_error = str(exc)
+                correction = (
+                    "\n\nPrevious candidate was rejected by the local canon validator: " + last_error
+                    + "\nReturn a complete replacement JSON. Correct that exact issue; do not add unsupported entries."
+                )
+        return {"error": f"story bible compiler rejected after 3 attempts: {last_error}"}
+
+    def plan_story_bible_chapter(self, direction, chapter_source, bible, chapter_no):
+        """Plan one chapter against immutable ids, never against raw prior chapters."""
+        canon = json.dumps({
+            "entities": [{"id": item["id"], "name": item["name"]} for item in bible["entities"]],
+            "facts": [
+                {"id": item["id"], "subject_id": item["subject_id"], "field": item["field"], "value": item["value"]}
+                for item in bible["facts"] if not is_runtime_state_fact(item)
+            ],
+        }, ensure_ascii=False)
+        prompt = f"""Return one JSON object only with exactly: schema_version, story_id, source_sha256, chapter,
+known_entity_ids, known_fact_ids, new_entities, new_facts, beats.
+
+schema_version must be story_bible_chapter_plan_v1. story_id is {bible['story_id']!r}.
+source_sha256 is {bible['source_sha256']!r}. chapter is {chapter_no}.
+Existing entities and facts MUST be selected by id from the canon below. Never restate an existing
+canonical name or value in a beat: use {{{{entity:id}}}} or {{{{fact:id}}}} tokens.
+new_entities use {{id,name,role,source_quote}}. new_facts use {{id,subject_id,field,value,source_quote}}.
+Every new source_quote must be copied exactly from the supplied macro outline. Do not invent new facts.
+Add a new_fact only when its value must remain true in later chapters: identity, relationship, duration,
+rule, location, ownership, named object, or another stable condition. Never add pressure, conflict, choice,
+result, scene, hook, emotional turn, reaction, or temporary chapter status as a new_fact.
+new_facts may and normally should be []. A disclosure or an event belongs in a beat unless the macro outline
+states a distinct durable canon value that later chapters must preserve. In particular, do not use fields ending
+in -status for a chapter's changing condition.
+Each beat is {{participant_ids,fact_ids,conflict,choice,result}}. participant_ids and fact_ids use ids only.
+known_fact_ids are available planning context. Put a fact id in a beat's fact_ids only when the prose must
+explicitly preserve that exact literal value; do not list background canon merely because it is relevant.
+
+Existing canon (authoritative):
+{canon}
+
+Story direction:
+{direction}
+
+Macro outline for this chapter only:
+{chapter_source}
+"""
+        correction = ""
+        last_error = ""
+        for attempt in range(1, 4):
+            response = self.llm.chat("outline", [
+                {"role": "system", "content": "You create a structured chapter plan. Canon ids are binding. Return strict JSON only."},
+                {"role": "user", "content": prompt + correction},
+            ], max_tokens=1800, temperature=0, json_mode=True)
+            if "error" in response:
+                return response
+            try:
+                payload = self._story_bible_json(response.get("content"), "chapter planner", (
+                    "schema_version", "story_id", "source_sha256", "chapter", "known_entity_ids", "known_fact_ids",
+                    "new_entities", "new_facts", "beats",
+                ))
+                payload = normalize_plan_canon_references(payload, bible, chapter_source)
+                payload = normalize_new_entry_source_quotes(payload, chapter_source)
+                validate_chapter_plan(payload, bible, chapter_no, chapter_source)
+                return {"content": payload}
+            except StoryBibleError as exc:
+                details = ""
+                if isinstance(locals().get("payload"), dict):
+                    additions = payload.get("new_facts", [])
+                    if isinstance(additions, list):
+                        details = json.dumps([
+                            {"id": item.get("id"), "value": item.get("value"), "source_quote": item.get("source_quote")}
+                            for item in additions if isinstance(item, dict)
+                        ], ensure_ascii=False)
+                last_error = str(exc) + (f"; candidate new_facts={details}" if details else "")
+                correction = (
+                    "\n\nPrevious candidate was rejected by the local canon validator: " + last_error
+                    + "\nReturn a complete replacement JSON. Correct that exact issue; do not change canon values. "
+                    + "If the rejected item is a chapter beat or temporary status, remove it entirely and set "
+                    + "new_facts to []; keep that information only in a beat."
+                )
+        return {"error": f"chapter planner rejected after 3 attempts: {last_error}"}
 
     def compile_chapter_contracts(self, direction, outline, world_bible, story_id, chapter_numbers):
         """Compile only hard chapter obligations; prose taste stays outside the contract."""
@@ -883,6 +1206,13 @@ class WritingEngine:
         # request count and fixed wait cost of 300-word segments.
         seg_words = int(self.w.get("segment_words", 500))
         seg_words = max(150, min(seg_words, 900))
+        segment_max_tokens = max(512, min(int(self.w.get("segment_max_tokens", 1200)), 1600))
+        segment_request_timeout = max(
+            10, min(int(self.w.get("segment_request_timeout_seconds", 40)), 90)
+        )
+        segment_request_attempts = max(
+            1, min(int(self.w.get("segment_request_attempts", 1)), 2)
+        )
         segment_cooldown = max(0, float(self.w.get("segment_cooldown", 1)))
         segment_recovery_attempts = max(0, min(int(self.w.get("segment_recovery_attempts", 0)), 2))
         segment_recovery_wait = max(0, float(self.w.get("segment_recovery_wait_seconds", 20)))
@@ -905,16 +1235,34 @@ class WritingEngine:
             if i == 0:
                 user = base + f"Write the opening ~{current_seg_words} words of this chapter. Output only prose."
             else:
-                user = base + f"Continue the chapter seamlessly, writing the next ~{current_seg_words} words. Output only prose.\n\nWritten so far:\n{full[-1500:]}"
+                user = base + (
+                    f"Continue the chapter seamlessly, writing the next ~{current_seg_words} words. "
+                    "The complete existing chapter text is below: treat every event in it as already happened. "
+                    "Advance to the next beat and never replay a completed revelation, confrontation, "
+                    "grant, action sequence, or ending. Output only new prose.\n\nWritten so far:\n"
+                    + full
+                )
             for segment_attempt in range(segment_recovery_attempts + 1):
+                print(
+                    f"    [writer] ch{chapter_n} segment {i + 1}/{n_segs} "
+                    f"(~{current_seg_words} words, attempt {segment_attempt + 1}) ...",
+                    flush=True,
+                )
                 r = self.llm.chat("writer", [
                     {"role": "system", "content": "You are a literary fiction writer. Write vivid, natural English prose."},
                     {"role": "user", "content": user},
-                ], max_tokens=2000, temperature=self.w["temperature"])
+                ], max_tokens=segment_max_tokens, temperature=self.w["temperature"],
+                   relay_max_attempts=segment_request_attempts,
+                   relay_request_timeout=segment_request_timeout)
                 if "error" not in r:
+                    print(
+                        f"    [writer] ch{chapter_n} segment {i + 1}/{n_segs} done "
+                        f"({r.get('elapsed', '?')}s)",
+                        flush=True,
+                    )
                     break
                 if (
-                    classify_failure(r.get("error")) != FailureType.NETWORK.value
+                    not is_transient_infrastructure_failure(classify_failure(r.get("error")))
                     or segment_attempt >= segment_recovery_attempts
                 ):
                     return r
@@ -971,50 +1319,61 @@ class WritingEngine:
 
         This is a bounded fallback after a candidate exists, not a new review
         loop: every replacement is tied to one exact source sentence and the
-        complete candidate must clear the same local rules afterward.
+        complete candidate must clear the same local rules afterward.  The
+        model returns the replacement sentence directly: requiring it to echo
+        a JSON ``find`` field caused valid single-line repairs to be discarded.
         """
-        anchors = quality_checks.strict_repair_anchors(text)
+        candidate, spacing_repairs = quality_checks.repair_deterministic_integrity(text)
+        audit = (["missing-space-after-terminal-punctuation"] if spacing_repairs else [])
+        anchors = quality_checks.strict_repair_anchors(candidate)
         if not anchors:
+            if candidate != text and not quality_checks.strict_prose_violations(candidate):
+                return {"repaired": True, "text": candidate, "rules": audit}
             return {"repaired": False, "reason": "no unique strict-rule anchors"}
-        candidate = text
-        audit = []
         for anchor in anchors:
             source = anchor["excerpt"]
+            rule_ids = anchor.get("rule_ids", [anchor["rule_id"]])
+            rule_label = "; ".join(rule_ids)
             result = self.llm.chat("writer", [
                 {"role": "system", "content": (
-                    "You are a precision fiction line editor. Return JSON only. "
-                    "Replace exactly one supplied sentence; preserve facts, plot, "
-                    "character agency, tense, and all surrounding prose."
+                    "You are a precision fiction line editor. Return only one replacement "
+                    "sentence, with no JSON, quotation marks, explanation, or Markdown. "
+                    "Preserve facts, plot, character agency, tense, and all surrounding prose."
                 )},
-                {"role": "user", "content": json.dumps({
-                    "task": "Return exactly {find, replace}.",
-                    "strict_rule": anchor["rule_id"],
-                    "find": source,
-                    "constraints": [
-                        "find must exactly equal the supplied sentence",
-                        "replace one grammatical English sentence only",
-                        "remove the strict-rule construction",
-                        "do not add facts, actions, dialogue, or named entities",
-                    ],
-                }, ensure_ascii=False)},
-            ], max_tokens=500, temperature=0.1, json_mode=True)
-            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", result.get("content", "").strip(), flags=re.I)
-            try:
-                draft = json.loads(raw)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                return {"repaired": False, "reason": f"invalid local repair JSON for {anchor['rule_id']}"}
-            replacement = draft.get("replace", "") if isinstance(draft, dict) else ""
-            if not isinstance(draft, dict) or draft.get("find") != source or candidate.count(source) != 1:
-                return {"repaired": False, "reason": f"unverified local repair for {anchor['rule_id']}"}
+                {"role": "user", "content": (
+                    f"Strict rule or rules to remove: {rule_label}\n"
+                    "Replace this exact sentence only:\n"
+                    + source
+                    + "\nConstraints: one grammatical English sentence; remove the strict-rule construction; "
+                    "do not add facts, actions, dialogue, or named entities."
+                )},
+            ], max_tokens=180, temperature=0.1)
+            if "error" in result:
+                return {"repaired": False, "reason": f"local repair request failed for {rule_label}: {result['error']}"}
+            replacement = re.sub(
+                r"^```(?:text)?\s*|\s*```$", "", (result.get("content") or "").strip(), flags=re.I,
+            ).strip()
+            if len(replacement) >= 2 and replacement[0] in "\"'" and replacement[-1] == replacement[0]:
+                replacement = replacement[1:-1].strip()
+            if candidate.count(source) != 1 or replacement == source:
+                return {"repaired": False, "reason": f"unverified local repair for {rule_label}"}
+            if "\n" in replacement or not re.search(r"[.!?][\"']?$", replacement):
+                return {"repaired": False, "reason": f"local repair did not return one complete sentence for {rule_label}"}
             errors = local_validate(source, replacement)
             if errors:
                 return {"repaired": False, "reason": "; ".join(errors)}
             candidate = candidate.replace(source, replacement, 1)
-            audit.append(anchor["rule_id"])
+            audit.extend(rule_ids)
+        # A prose replacement can accidentally join two otherwise valid
+        # sentences. Apply the same deterministic integrity repair after every
+        # bounded rewrite before deciding whether the candidate clears.
+        candidate, spacing_repairs = quality_checks.repair_deterministic_integrity(candidate)
+        if spacing_repairs:
+            audit.append("missing-space-after-terminal-punctuation")
         remaining = quality_checks.strict_prose_violations(candidate)
         if remaining:
             return {"repaired": False, "reason": "; ".join(remaining)}
-        return {"repaired": True, "text": candidate, "rules": audit}
+        return {"repaired": True, "text": candidate, "rules": list(dict.fromkeys(audit))}
 
     def _word_feedback(self, text, target, lo, hi):
         """具体化的字数反馈：告诉模型差多少、怎么补/删。"""
@@ -1027,6 +1386,44 @@ class WritingEngine:
             return (f"You wrote {wc} words, about {wc - target} over the {target}-word target. "
                     f"Trim redundancy, tighten sentences, cut filler words and repeated beats.")
         return ""
+
+    def compact_chapter_to_word_limit(self, text, minimum_words, maximum_words, protected_quotes):
+        """Make one bounded full-text compression after acceptance found only length overflow."""
+        quotes = []
+        for quote in protected_quotes or []:
+            if isinstance(quote, str) and quote.strip() and quote not in quotes:
+                quotes.append(quote)
+        result = self.llm.chat("writer", [
+            {"role": "system", "content": (
+                "You are a precise fiction line editor. Return only the complete revised chapter, "
+                "with no commentary or headings."
+            )},
+            {"role": "user", "content": (
+                f"Compress this existing chapter to {minimum_words}-{maximum_words} English words. "
+                "Only delete redundancy or tighten existing sentences; do not add, remove, reorder, "
+                "or change any plot event, fact, relationship, or ending. Preserve every protected "
+                "quote exactly, character for character.\n\nProtected quotes:\n"
+                + json.dumps(quotes, ensure_ascii=False)
+                + "\n\nChapter:\n---\n" + text + "\n---"
+            )},
+        ], max_tokens=max(512, min(2200, int(maximum_words * 1.8))), temperature=0.1)
+        if "error" in result:
+            return result
+        candidate = (result.get("content") or "").strip()
+        if not candidate:
+            return {"error": "length compaction returned empty text"}
+        missing_quotes = [quote for quote in quotes if quote not in candidate]
+        if missing_quotes:
+            return {"error": "length compaction changed protected acceptance evidence"}
+        word_count = count_words(candidate)
+        if not minimum_words <= word_count <= maximum_words:
+            return {
+                "error": (
+                    f"length compaction produced {word_count} words outside "
+                    f"{minimum_words}-{maximum_words}"
+                )
+            }
+        return {"content": candidate, "words": word_count}
 
     def write_with_retry(self, direction, outline, world_bible, chapter_n, total, target_words, extra_rules=""):
         """写一章，字数硬校验，不符则带具体反馈重写（最多 max_rewrite 次）。"""
@@ -1109,7 +1506,7 @@ class WritingEngine:
         ], max_tokens=800, temperature=0.3)
         return r
 
-    def generate_state_delta(self, text, chapter_no, contract, scenes=()):
+    def generate_state_delta(self, text, chapter_no, contract, scenes=(), canon_fact_slots=(), correction=""):
         """Use the structured reviewer route for an actual-state JSON record."""
         required = {
             "chapter": chapter_no,
@@ -1121,10 +1518,20 @@ class WritingEngine:
                 "completion_assertion": scene["completion_assertion"],
                 "fact_slots": scene["fact_slots"],
             } for scene in scenes],
+            "canon_fact_slots": list(canon_fact_slots),
         }
         # Controlled state is the inter-chapter authority. Use its dedicated
         # structured-extraction route, separate from literary acceptance and
         # long-form outline generation.
+        correction_prompt = ""
+        if correction:
+            correction_prompt = (
+                "\n\nThe previous state JSON was rejected by deterministic validation: "
+                + correction[:1600]
+                + " Re-read the supplied chapter. Return a complete replacement JSON, and copy every evidence string "
+                "as an exact contiguous substring from the chapter. Do not add opening or closing quotation marks "
+                "unless those exact marks are part of the copied substring."
+            )
         return self.llm.chat("state_delta", [
             {"role": "system", "content": (
                 "You are a continuity editor. Report only what the supplied chapter explicitly establishes. "
@@ -1137,17 +1544,18 @@ class WritingEngine:
                 "non_regression_statuses is a list of assertion_id, status (preserved|violated|unclear), and an exact "
                 "chapter quotation as evidence. Evidence must be a literal contiguous substring copied from the chapter: do not add "
                 "quotation marks, alter punctuation, normalize apostrophes, or paraphrase narrative prose. Include one status for every supplied assertion ID. Copy the chapter and source hash "
-                "exactly from the control input. scene_statuses must contain every supplied scene_id using exactly {scene_id,status,occurrence_count,evidence}; status is completed|repeated|missing|unclear. Count every substantive replay of that scene in the chapter: only completed with occurrence_count 1 passes. fact_statuses must contain every supplied fact slot using exactly {fact_id,status,value,evidence}; never use fact_slot_id or any alternate key. Status is consistent|contradicted|unclear. Copy the supplied canonical value exactly when consistent; report contradicted if the chapter gives any competing value. Set new_information, relationship_changes, open_hooks, and conflicts_with_contract to [] exactly. Do not summarize the chapter in those fields. "
+                "exactly from the control input. scene_statuses must contain every supplied scene_id using exactly {scene_id,status,occurrence_count,evidence}; status is completed|repeated|missing|unclear. Mark a scene completed when its supplied completion assertion is explicitly established anywhere in the chapter. Do not mark it unclear merely because other setup, conflict, choice, result, or irreversible-change details for that scene are omitted from the chapter: the completion assertion is the pass criterion. Every evidence field must be a non-empty literal contiguous substring from the chapter, including unclear or missing statuses; never return an empty evidence string. Count a scene as repeated only when its exact supplied completion assertion is substantively enacted twice. Do not count repeated props, names, settings, clues, or partial setup beats as a replay: for example, two different footprints do not repeat a scene whose completion is that a footprint leads deeper underground. A later reference, consequence, memory, or discussion of an already completed scene is not a replay. When the text is ambiguous, report occurrence_count 1 rather than guessing a duplicate. Only completed with occurrence_count 1 passes. For a non-regression rule describing the absence of harm, mark preserved when its supplied positive evidence requirement is directly established and the chapter contains no contrary event; do not demand proof of an absence beyond the supplied chapter. fact_statuses must contain every supplied fact slot, including scene fact slots and canon_fact_slots, using exactly {fact_id,status,value,evidence}; never use fact_slot_id or any alternate key. Status is consistent|contradicted|unclear. Every value must be a non-empty string: copy the canonical value when consistent or unclear, and give the competing observed value when contradicted. A canonical value is a summary, so its evidence may use different natural-language words; judge whether the quote preserves or contradicts its meaning. Canon fact slots may be unclear when the chapter does not actively establish the fact, but must be contradicted when the chapter gives a competing value. Report only explicit new information, relationship changes, and one short unresolved open hook when the chapter leaves one; use [] only when the chapter genuinely establishes none. Do not summarize the chapter or invent an implication. "
                 "\n\nControl input:\n"
                 + json.dumps(required, ensure_ascii=False)
+                + correction_prompt
                 + "\n\nChapter text:\n---\n" + text + "\n---"
             )},
         # GLM returns reliable structured text through ordinary chat, whereas
         # its Ark response_format mode can stall or return no content. The
         # parser below still validates the complete JSON schema and evidence.
-        ], max_tokens=800, temperature=0.1, json_mode=False)
+        ], max_tokens=min(1800, 800 + 80 * len(canon_fact_slots)), temperature=0.1, json_mode=False)
 
-    def repair_chapter_with_verified_patches(self, text, acceptance):
+    def repair_chapter_with_verified_patches(self, text, acceptance, repair_context=None):
         """Repair acceptance findings without letting a model rewrite other prose."""
         repairable_outcomes = [
             outcome for outcome in acceptance.get("outcomes", [])
@@ -1181,41 +1589,64 @@ class WritingEngine:
             "reason": finding.get("reason"),
             "evidence_quotes": finding.get("evidence_quotes"),
         } for finding in findings]
-        response = self.llm.chat("writer", [
-            {"role": "system", "content": (
-                "You are a fiction copy editor. Return JSON only with exactly one key: patches. "
-                "patches is a non-empty array. Use {find,replace} only when find copies one supplied "
-                "finding anchor exactly, character for character. Use {insert_after,insert} only when "
-                "insert_after copies one supplied insertion anchor exactly; insert must be one short paragraph "
-                "of at most 120 English words. Do not include surrounding text, new commentary, or a full chapter. "
-                "Repair only the cited defect."
-            )},
-            {"role": "user", "content": (
-                "Incomplete required outcomes with verified insertion anchors:\n" + json.dumps(repair_outcomes, ensure_ascii=False) +
-                "\n\nVerified acceptance findings:\n" + json.dumps(repair_request, ensure_ascii=False) +
-                "\n\nAllowed exact anchors:\n" + json.dumps(anchors, ensure_ascii=False) +
-                "\n\nAllowed exact insertion anchors:\n" + json.dumps(insertion_anchors, ensure_ascii=False) +
-                "\n\nChapter text:\n---\n" + text + "\n---"
-            )},
-        ], max_tokens=1800, temperature=0.25, json_mode=True)
-        if "error" in response:
-            return response
-        try:
-            raw = re.sub(
-                r"^```(?:json)?\s*|\s*```$", "", (response.get("content") or "").strip(), flags=re.I,
+        rejection_feedback = ""
+        rejected_audits = []
+        for patch_attempt in range(2):
+            response = self.llm.chat("writer", [
+                {"role": "system", "content": (
+                    "You are a fiction copy editor. Return JSON only with exactly one key: patches. "
+                    "patches is a non-empty array. Use {find,replace} only when find copies one supplied "
+                    "finding anchor exactly, character for character. Use {insert_after,insert} only when "
+                    "insert_after copies one supplied insertion anchor exactly; insert must be one short paragraph "
+                    "of at most 120 English words. Do not include surrounding text, new commentary, or a full chapter. "
+                    "Repair only the cited defect. When a repair reference packet is supplied, it is the frozen "
+                    "chapter authority: preserve its end assertions, non-regressions, fact-slot literals, and "
+                    "approved temporal precision. Do not invent clock times or make an elapsed duration more precise "
+                    "than the packet establishes."
+                )},
+                {"role": "user", "content": (
+                    "Incomplete required outcomes with verified insertion anchors:\n" + json.dumps(repair_outcomes, ensure_ascii=False) +
+                    "\n\nVerified acceptance findings:\n" + json.dumps(repair_request, ensure_ascii=False) +
+                    ("\n\nFrozen chapter repair reference packet:\n" + json.dumps(repair_context, ensure_ascii=False)
+                     if repair_context is not None else "") +
+                    "\n\nAllowed exact anchors:\n" + json.dumps(anchors, ensure_ascii=False) +
+                    "\n\nAllowed exact insertion anchors:\n" + json.dumps(insertion_anchors, ensure_ascii=False) +
+                    rejection_feedback + "\n\nChapter text:\n---\n" + text + "\n---"
+                )},
+            ], max_tokens=1800, temperature=0.25, json_mode=True)
+            if "error" in response:
+                return response
+            try:
+                raw = re.sub(
+                    r"^```(?:json)?\s*|\s*```$", "", (response.get("content") or "").strip(), flags=re.I,
+                )
+                payload = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                return {"error": f"acceptance patch response is not valid JSON: {exc}"}
+            if not isinstance(payload, dict) or set(payload) != {"patches"}:
+                return {"error": "acceptance patch response must contain only patches"}
+            applied = apply_scoped_patches(
+                text, payload["patches"], anchors, insertion_anchors, repair_context=repair_context,
             )
-            payload = json.loads(raw)
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            return {"error": f"acceptance patch response is not valid JSON: {exc}"}
-        if not isinstance(payload, dict) or set(payload) != {"patches"}:
-            return {"error": "acceptance patch response must contain only patches"}
-        applied = apply_scoped_patches(text, payload["patches"], anchors, insertion_anchors)
-        if not applied["accepted"]:
-            return {"error": "acceptance repair scope rejected: " + "; ".join(applied["errors"]), "audit": applied["audit"]}
-        return {"content": applied["text"], "audit": applied["audit"]}
+            if applied["accepted"]:
+                if rejected_audits:
+                    applied["audit"]["prior_rejections"] = rejected_audits
+                return {"content": applied["text"], "audit": applied["audit"]}
+            if patch_attempt:
+                return {
+                    "error": "acceptance repair scope rejected: " + "; ".join(applied["errors"]),
+                    "audit": applied["audit"],
+                }
+            rejected_audits.append({"errors": applied["errors"], "audit": applied["audit"]})
+            rejection_feedback = (
+                "\n\nThe previous patch proposal was rejected by the scope validator: "
+                + "; ".join(applied["errors"])
+                + ". Return a new patch using the same verified anchors; do not repeat those errors."
+            )
 
 
 def main():
+    configure_runtime_streams()
     args = build_argument_parser().parse_args()
 
     if args.assemble_only:
@@ -1254,6 +1685,12 @@ def main():
     if args.outline_model:
         engine.llm.models["outline"] = args.outline_model
         print(f"[model override] outline={args.outline_model}")
+    if args.segment_words is not None:
+        engine.w["segment_words"] = args.segment_words
+        print(f"[writer override] segment_words={args.segment_words}")
+    if args.segment_request_timeout is not None:
+        engine.w["segment_request_timeout_seconds"] = args.segment_request_timeout
+        print(f"[writer override] segment_request_timeout_seconds={args.segment_request_timeout}")
     if args.no_experiences:
         engine.experience_runtime.enabled = False
     # 章节数/字数默认从 config 读（唯一来源），命令行显式传参时才覆盖
@@ -1261,6 +1698,9 @@ def main():
         args.chapters = int(engine.w.get("default_chapters", 12))
     if args.words is None:
         args.words = int(engine.w.get("default_words", 700))
+    # Planning and writing must use one chapter target for this run.  Without
+    # this, a one-chapter smoke test still builds the configured 12-chapter plan.
+    engine.w["default_chapters"] = args.chapters
     # Explicit CLI word targets must also drive the validation band.
     if args.words != engine.w.get("default_words"):
         band = float(engine.w.get("word_band", 0.1))
@@ -1365,22 +1805,80 @@ def main():
 
     if args.outline_only:
         print("\n" + outline_text)
+        task_store.finish_run(
+            run_id, args.story_id, "writing", "completed",
+            round(time.time() - run_started, 1), "outline only",
+        )
         return 0
 
     # 2. 设定圣经（world bible）
+    # Story-bible mode seeds canon only from information known before Chapter
+    # One.  Its world bible must therefore be isolated from the normal one,
+    # which intentionally summarizes the full outline and may contain future
+    # chapter events.
+    world_bible_source = outline_text
     bible_path = os.path.join(out_dir, "world_bible.md")
+    bible_label = "world bible"
+    if args.story_bible:
+        try:
+            world_bible_source = story_bible_foundation(outline_text)
+        except StoryBibleError as exc:
+            print(f"STORY BIBLE ERROR: {exc}")
+            task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), str(exc))
+            return 2
+        bible_path = os.path.join(out_dir, "story_bible_world_bible.md")
+        bible_label = "story-bible foundation"
     if should_reuse_planning_artifact(args, bible_path):
         bible_text = open(bible_path, encoding="utf-8").read()
-        print(f"[2/4] reusing world bible ({len(bible_text)} chars)")
+        print(f"[2/4] reusing {bible_label} ({len(bible_text)} chars)")
     else:
-        print("[2/4] generating world bible ...")
-        bible = engine.write_world_bible(direction, outline_text)
+        print(f"[2/4] generating {bible_label} ...")
+        bible = engine.write_world_bible(direction, world_bible_source)
         bible_text = bible["content"] if "error" not in bible else ""
         if bible_text:
             open(bible_path, "w", encoding="utf-8").write(bible_text)
-            print(f"    world bible done ({bible['elapsed']}s, {len(bible_text)} chars)")
+            print(f"    {bible_label} done ({bible['elapsed']}s, {len(bible_text)} chars)")
         else:
-            print(f"    world bible FAILED: {bible.get('error')}")
+            print(f"    {bible_label} FAILED: {bible.get('error')}")
+
+    story_bible_document = None
+    story_bible_path = os.path.join(out_dir, "story_bible.json")
+    if args.story_bible:
+        expected_bible_hash = story_bible_planning_hash(direction, outline_text, bible_text)
+        if os.path.exists(story_bible_path):
+            try:
+                story_bible_document = load_story_bible(
+                    story_bible_path, args.story_id, expected_bible_hash,
+                )
+                print(f"[story-bible] reusing {len(story_bible_document['facts'])} fixed fact(s)")
+            except StoryBibleError as exc:
+                print(f"STORY BIBLE ERROR: {exc}")
+                task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), str(exc))
+                return 2
+        else:
+            print("[story-bible] compiling fixed facts ...")
+            compiled_bible = engine.compile_story_bible(direction, outline_text, bible_text, args.story_id)
+            if "error" in compiled_bible:
+                print(f"STORY BIBLE ERROR: {compiled_bible['error']}")
+                task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), compiled_bible["error"])
+                return 2
+            story_bible_document = compiled_bible["content"]
+            save_story_bible(story_bible_path, story_bible_document)
+            print(f"    story bible done ({len(story_bible_document['entities'])} entities, {len(story_bible_document['facts'])} facts)")
+
+    if args.planning_only:
+        if not bible_text:
+            task_store.finish_run(
+                run_id, args.story_id, "writing", "failed",
+                round(time.time() - run_started, 1), "world bible generation failed",
+            )
+            return 1
+        task_store.finish_run(
+            run_id, args.story_id, "writing", "completed",
+            round(time.time() - run_started, 1), "planning only",
+        )
+        print("[planning] outline and world bible saved; skipping control compilation and chapter writing")
+        return 0
 
     control_bundle = None
     control_runtime = None
@@ -1451,7 +1949,8 @@ def main():
     for chapter_no in chapter_range:
         chapter_store.update(chapter_no, ChapterStatus.PENDING.value)
 
-    # 质量门槛：可选盲评重写（确保每章 naturalness 达标）
+    # Chapter acceptance remains mandatory. Blind naturalness review is a
+    # separate diagnostic and must not delay chapter persistence or rewrite prose.
     judge = None
     chapter_acceptance_enabled = False
     chapter_acceptance_rounds = 0
@@ -1459,10 +1958,9 @@ def main():
     chapter_requirements = {}
     if args.quality_gate:
         from native_check import (
-            QualityJudge, build_acceptance_reviewers, freeze_acceptance_issue_ledger,
+            build_acceptance_reviewers, freeze_acceptance_issue_ledger,
             extract_chapter_requirements, review_chapter_acceptance,
         )
-        judge = QualityJudge(os.environ)
         try:
             acceptance_cfg = load_json(os.path.join(HERE, "orchestrator.json")).get("chapter_acceptance", {})
         except (OSError, ValueError, json.JSONDecodeError):
@@ -1493,14 +1991,32 @@ def main():
                 }
 
     def _write_acceptance_artifact(chapter_no, history, issue_ledger=None):
-        """Keep failed candidates out of the story directory but retain their audit trail."""
-        target = os.path.join(HERE, "out", args.story_id, "chapter_acceptance", f"ch{chapter_no:04d}.json")
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        artifact = {"story_id": args.story_id, "chapter": chapter_no, "history": history}
+        """Write a latest view plus an immutable audit copy for this run."""
+        root = os.path.join(HERE, "out", args.story_id, "chapter_acceptance")
+        latest_target = os.path.join(root, f"ch{chapter_no:04d}.json")
+        run_target = os.path.join(root, "runs", run_id, f"ch{chapter_no:04d}.json")
+        artifact = {
+            "story_id": args.story_id,
+            "run_id": run_id,
+            "chapter": chapter_no,
+            "history": history,
+        }
         if issue_ledger is not None:
             artifact["issue_ledger"] = issue_ledger
+        for target in (latest_target, run_target):
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8") as handle:
+                json.dump(artifact, handle, ensure_ascii=False, indent=2)
+
+    def _write_acceptance_candidate(chapter_no, text):
+        """Preserve generated prose for a later strict recheck without publishing it."""
+        target = os.path.join(
+            HERE, "out", args.story_id, "chapter_acceptance", "runs", run_id,
+            f"ch{chapter_no:04d}.candidate.md",
+        )
+        os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8") as handle:
-            json.dump(artifact, handle, ensure_ascii=False, indent=2)
+            handle.write(text)
 
     # 块状并行块数：命令行 > config（默认 1 = 串行）
     requested_blocks = args.parallel_blocks
@@ -1530,10 +2046,20 @@ def main():
             if not contract:
                 return False
             engine.llm.set_call_context(purpose="control_state_delta")
-            result = engine.generate_state_delta(text, chapter_no, contract, control_runtime.scenes_for(chapter_no))
-            if control_runtime.record_state_delta(chapter_no, text, result):
-                print(f"    [control] state delta passed ch{chapter_no}", flush=True)
-                return True
+            canon_fact_slots = (
+                planned_fact_slots(story_bible_document, chapter_no)
+                if story_bible_document is not None else ()
+            )
+            for state_attempt in range(2):
+                if state_attempt:
+                    print(f"    [control] state delta evidence correction 2/2 ch{chapter_no}", flush=True)
+                result = engine.generate_state_delta(
+                    text, chapter_no, contract, control_runtime.scenes_for(chapter_no), canon_fact_slots,
+                    correction=control_runtime.last_state_failure if state_attempt else "",
+                )
+                if control_runtime.record_state_delta(chapter_no, text, result, canon_fact_slots):
+                    print(f"    [control] state delta passed ch{chapter_no}", flush=True)
+                    return True
             print(f"    [control] state delta failed ch{chapter_no}", flush=True)
             return False
         engine.llm.set_call_context(purpose="handoff")
@@ -1548,15 +2074,40 @@ def main():
 
     def _write_one(n, handoff=""):
         """写一章（含质量门槛），返回 (n, text)。失败返回 (n, None)，由补跑循环重试。"""
+        nonlocal story_bible_document
         chapter_started = time.time()
         engine.llm.set_chapter_context(n)
         progress.update("writing", f"ch {n}/{n_chapters}", args.story_id)
         print(f"[3/4] writing chapter {n}/{n_chapters} ...", flush=True)
+        story_bible_packet = ""
+        if story_bible_document is not None:
+            try:
+                macro_section = chapter_outline_section(outline_text, n)
+                chapter_key = f"{n:04d}"
+                if chapter_key not in story_bible_document["chapter_plans"]:
+                    engine.llm.set_call_context(purpose="story_bible_chapter_plan")
+                    planned = engine.plan_story_bible_chapter(direction, macro_section, story_bible_document, n)
+                    if "error" in planned:
+                        raise StoryBibleError(planned["error"])
+                    story_bible_document = commit_chapter_plan(
+                        story_bible_document, planned["content"], macro_section,
+                    )
+                    save_story_bible(story_bible_path, story_bible_document)
+                    print(f"    [story-bible] chapter {n} plan committed", flush=True)
+                story_bible_packet = render_chapter_packet(story_bible_document, n)
+            except StoryBibleError as exc:
+                failure = f"story bible rejected chapter {n} plan: {exc}"
+                chapter_store.update(
+                    n, ChapterStatus.FAILED.value, elapsed_s=round(time.time() - chapter_started, 1),
+                    error=failure, failure_type=classify_failure(str(exc)),
+                )
+                print(f"    STORY BIBLE ERROR ch{n}: {exc}", flush=True)
+                return n, None
         handoff_block = ""
         if handoff:
             handoff_block = ("\n\nHandoff from the previous chapter (this chapter MUST start from this exact state):\n" + handoff)
         quality_feedback = ""
-        blind_evidence = {}
+        blind_evidence = {"status": "deferred"}
         r = None
         text = ""
         best = None
@@ -1596,9 +2147,27 @@ def main():
                 extra += "\n\n" + controlled["text"]
             if experience_block:
                 extra += "\n\n" + experience_block
+            # The verified current-chapter control packet is the execution
+            # authority. Re-sending the whole book plan here both dilutes that
+            # authority and exceeds relay request limits on long serial plans.
+            writer_outline = outline_text
+            writer_bible = bible_text
+            if story_bible_packet:
+                writer_outline = story_bible_packet
+                writer_bible = ""
+            if control_bundle:
+                current_requirements = chapter_requirements.get(n, [])
+                writer_outline = (
+                    f"Chapter {n} execution brief:\n"
+                    + "\n".join(f"- {item['requirement']}" for item in current_requirements)
+                    + "\nUse the chapter-local controlled execution packet below as the binding scene plan."
+                )
+                writer_bible = ""
+                if story_bible_packet:
+                    extra += "\n\nStory-bible canon for this chapter:\n" + story_bible_packet
             # Blind-review retries create a new candidate. They never mutate a
             # prior candidate because blind feedback has no verified edit span.
-            r = engine.write_with_retry(direction, outline_text, bible_text, n, n_chapters, args.words, extra)
+            r = engine.write_with_retry(direction, writer_outline, writer_bible, n, n_chapters, args.words, extra)
             if "error" in r:
                 chapter_store.update(
                     n, ChapterStatus.FAILED.value, attempt=qa + 1,
@@ -1620,6 +2189,8 @@ def main():
                     r["words"] = count_words(text)
                     strict_violations = quality_checks.strict_prose_violations(text)
                     print(f"    ch{n} repaired strict rule(s) locally: {repaired['rules']}", flush=True)
+                else:
+                    print(f"    ch{n} strict local repair rejected: {repaired.get('reason', 'unknown reason')}", flush=True)
             if strict_violations and not last_quality_attempt:
                 quality_feedback = (
                     "\n\nHard prose-rule violation. Rewrite the chapter and remove every instance: "
@@ -1633,7 +2204,10 @@ def main():
                 print(f"    ch{n} strict prose rule hit, rewriting...", flush=True)
                 continue
             if strict_violations:
-                r["error"] = "strict prose rules unresolved: " + "; ".join(strict_violations)
+                r["error"] = (
+                    "strict prose rules unresolved: " + "; ".join(strict_violations)
+                    + "; local repair: " + repaired.get("reason", "unknown reason")
+                )
                 r["failure_type"] = FailureType.QUALITY.value
                 break
             if not judge:
@@ -1698,11 +2272,36 @@ def main():
         text, removed_repeats = quality_checks.remove_exact_repeats(text)
         if removed_repeats:
             r["warning"] = f"removed {removed_repeats} adjacent duplicate paragraph(s)"
+        story_bible_audit = None
+        if story_bible_document is not None:
+            story_bible_audit = audit_chapter_facts(story_bible_document, n, text)
+            audit_path = os.path.join(out_dir, f"ch{n:04d}.story_bible_audit.json")
+            with open(audit_path, "w", encoding="utf-8") as handle:
+                json.dump(story_bible_audit, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            if story_bible_audit["findings"]:
+                failure = "; ".join(item["message"] for item in story_bible_audit["findings"])
+                try:
+                    story_bible_document = rollback_chapter_plan(story_bible_document, n)
+                    save_story_bible(story_bible_path, story_bible_document)
+                except StoryBibleError as exc:
+                    failure += f"; story bible rollback failed: {exc}"
+                chapter_store.update(
+                    n, ChapterStatus.FAILED.value, elapsed_s=round(time.time() - chapter_started, 1),
+                    error=failure, failure_type=FailureType.QUALITY.value,
+                )
+                print(f"    STORY BIBLE ERROR ch{n}: {failure}", flush=True)
+                return n, None
         acceptance = None
         if chapter_acceptance_enabled:
+            _write_acceptance_candidate(n, text)
             acceptance_history = []
             issue_ledger = None
             for acceptance_round in range(chapter_acceptance_rounds + 1):
+                # Keep the retained candidate aligned with the exact text under
+                # review. A bounded acceptance repair changes ``text`` before
+                # the next round, so the initial write alone is insufficient.
+                _write_acceptance_candidate(n, text)
                 local_blockers = quality_checks.strict_prose_violations(text)
                 words = count_words(text)
                 if words < engine.w["word_min"] or words > engine.w["word_max"]:
@@ -1712,11 +2311,15 @@ def main():
                 if issue_ledger is None:
                     acceptance = review_chapter_acceptance(
                         f"ch{n:04d}.md", text, chapter_requirements.get(n, []), chapter_acceptance_reviewers,
+                        editorial_findings=bool(acceptance_cfg.get("editorial_findings", True)),
+                        contract_evidence_only=bool(acceptance_cfg.get("contract_evidence_only", False)),
                     )
                 else:
                     acceptance = review_chapter_acceptance(
                         f"ch{n:04d}.md", text, chapter_requirements.get(n, []), chapter_acceptance_reviewers,
                         issue_ledger=issue_ledger,
+                        editorial_findings=bool(acceptance_cfg.get("editorial_findings", True)),
+                        contract_evidence_only=bool(acceptance_cfg.get("contract_evidence_only", False)),
                     )
                 acceptance_gate = quality_gate.chapter_acceptance_decision(
                     acceptance, text, local_blockers, issue_ledger=issue_ledger,
@@ -1740,11 +2343,15 @@ def main():
                     break
                 if acceptance_gate["decision"] == "verification_failed":
                     failure = "; ".join(acceptance_gate["blockers"])
+                    failure_type = acceptance_failure_type(acceptance, failure)
                     chapter_store.update(
                         n, ChapterStatus.FAILED.value, elapsed_s=round(time.time() - chapter_started, 1),
-                        error=failure, failure_type=FailureType.QUALITY.value,
+                        error=failure, failure_type=failure_type,
                     )
-                    print(f"    CH{n} acceptance verification failed: {failure}", flush=True)
+                    provider_summary = acceptance_failure_summary(acceptance)
+                    if provider_summary:
+                        print(f"    [acceptance] provider failures: {provider_summary}", flush=True)
+                    print(f"    CH{n} acceptance verification failed [{failure_type}]: {failure}", flush=True)
                     return n, None
                 if acceptance_round >= chapter_acceptance_rounds:
                     failure = "chapter acceptance unresolved after repair budget: " + "; ".join(acceptance_gate["blockers"])
@@ -1758,6 +2365,43 @@ def main():
                     n, ChapterStatus.RETRYING.value, attempt=acceptance_round + 1,
                     failure_type=FailureType.QUALITY.value, warning="; ".join(acceptance_gate["blockers"])[:500],
                 )
+                length_overflow_only = (
+                    words > engine.w["word_max"]
+                    and len(local_blockers) == 1
+                    and not acceptance_gate.get("repair_findings")
+                    and all(outcome.get("status") == "met" for outcome in acceptance.get("outcomes", []))
+                )
+                if length_overflow_only:
+                    protected_quotes = [
+                        quote for outcome in acceptance.get("outcomes", [])
+                        for quote in outcome.get("evidence_quotes", [])
+                        if isinstance(quote, str)
+                    ]
+                    engine.llm.set_call_context(
+                        attempt=acceptance_round + 1, purpose="chapter_length_compaction", retry_index=acceptance_round,
+                    )
+                    compacted = engine.compact_chapter_to_word_limit(
+                        text, engine.w["word_min"], engine.w["word_max"], protected_quotes,
+                    )
+                    acceptance_history[-1]["length_compaction"] = {
+                        "before_words": words,
+                        "after_words": compacted.get("words"),
+                        "status": "accepted" if "error" not in compacted else "rejected",
+                    }
+                    _write_acceptance_artifact(n, acceptance_history, issue_ledger)
+                    if "error" in compacted:
+                        failure = compacted["error"]
+                        chapter_store.update(
+                            n, ChapterStatus.FAILED.value, elapsed_s=round(time.time() - chapter_started, 1),
+                            error=failure, failure_type=FailureType.QUALITY.value,
+                        )
+                        print(f"    CH{n} length compaction failed: {failure}", flush=True)
+                        return n, None
+                    text = compacted["content"]
+                    r["text"] = text
+                    r["words"] = compacted["words"]
+                    print(f"    ch{n} length overflow -> bounded compaction {acceptance_round + 1}/{chapter_acceptance_rounds}", flush=True)
+                    continue
                 engine.llm.set_call_context(
                     attempt=acceptance_round + 1, purpose="chapter_acceptance_repair", retry_index=acceptance_round,
                 )
@@ -1765,14 +2409,29 @@ def main():
                 if issue_ledger is not None and not ledger_frozen_this_round:
                     repair_review = dict(acceptance)
                     repair_review["findings"] = acceptance_gate["repair_findings"]
-                repaired = engine.repair_chapter_with_verified_patches(text, repair_review)
+                repair_context = None
+                if control_bundle:
+                    try:
+                        prior_delta = load_state_delta(control_dir, n - 1) if n > 1 else None
+                        repair_context = build_repair_context(control_bundle, n, prior_delta)
+                    except ControlContractError as exc:
+                        failure = f"control repair reference unavailable: {exc}"
+                        chapter_store.update(
+                            n, ChapterStatus.FAILED.value, elapsed_s=round(time.time() - chapter_started, 1),
+                            error=failure, failure_type=FailureType.QUALITY.value,
+                        )
+                        print(f"    CH{n} acceptance repair failed: {failure}", flush=True)
+                        return n, None
+                repaired = engine.repair_chapter_with_verified_patches(
+                    text, repair_review, repair_context=repair_context,
+                )
                 acceptance_history[-1]["repair"] = repaired.get("audit") or {"status": "rejected"}
                 _write_acceptance_artifact(n, acceptance_history, issue_ledger)
                 if "error" in repaired or not repaired.get("content", "").strip():
                     failure = repaired.get("error", "chapter acceptance repair returned empty text")
                     chapter_store.update(
                         n, ChapterStatus.FAILED.value, elapsed_s=round(time.time() - chapter_started, 1),
-                        error=failure, failure_type=FailureType.QUALITY.value,
+                        error=failure, failure_type=classify_failure(failure),
                     )
                     print(f"    CH{n} acceptance repair failed: {failure}", flush=True)
                     return n, None
@@ -1811,6 +2470,10 @@ def main():
             local_warnings=local_warnings,
             state_failure=state_failure,
             acceptance=acceptance,
+            canonical_names=(
+                [card["name"] for card in control_bundle["artifacts"]["character_voice_cards"]["characters"]]
+                if control_bundle else None
+            ),
         )
         quality_gate.write_report(
             os.path.join(out_dir, f"ch{n:04d}.quality_gate.json"), quality_report
@@ -1819,7 +2482,8 @@ def main():
             failure = state_failure
             chapter_store.update(
                 n, ChapterStatus.FAILED.value, elapsed_s=round(time.time() - chapter_started, 1),
-                error=failure, failure_type=FailureType.QUALITY.value,
+                error=failure,
+                failure_type=control_runtime.last_state_failure_type or FailureType.QUALITY.value,
             )
             print(f"    CONTROL ERROR ch{n}: {failure}", flush=True)
             return n, None
@@ -1933,7 +2597,7 @@ def main():
             prev_path = os.path.join(out_dir, f"ch{start - 1:04d}.md")
             if os.path.exists(prev_path):
                 prev = open(prev_path, encoding="utf-8").read()
-        handoff = _handoff_for(prev, start - 1) if prev else ""
+        handoff = initial_recovery_handoff(control_bundle, prev, start - 1, _handoff_for)
         for index, n in enumerate(suffix):
             nn, text = _write_one(n, handoff)
             if not text:
@@ -1966,7 +2630,8 @@ def main():
             if os.path.exists(os.path.join(out_dir, f"ch{n:04d}.md"))
         }
         status_missing = [n for n in range(1, n_chapters + 1) if n not in status_completed]
-    run_status = "completed" if not missing else "partial"
+    final_rows = {int(row["chapter_no"]): row for row in chapter_store.list()}
+    run_status = final_run_status(missing, final_rows)
     write_status(
         out_dir,
         run_id=run_id,
@@ -1975,18 +2640,23 @@ def main():
         completed_chapters=status_completed,
         missing_chapters=status_missing,
     )
-    task_store.finish_run(
-        run_id, args.story_id, "writing", run_status,
-        round(time.time() - run_started, 1),
-        f"missing chapters: {missing}" if missing else None,
-    )
-
     if missing:
-        print("[writing] partial run is not deliverable; skipping summary", flush=True)
+        task_store.finish_run(
+            run_id, args.story_id, "writing", run_status,
+            round(time.time() - run_started, 1), f"missing chapters: {missing}",
+        )
+        label = "infrastructure failure" if run_status == "failed_infra" else "partial run"
+        print(f"[writing] {label} is not deliverable; skipping summary", flush=True)
         return 2
     if not results:
         print("no chapters written")
         return 2
+    if args.chapter > 0:
+        task_store.finish_run(
+            run_id, args.story_id, "writing", "completed", round(time.time() - run_started, 1), None,
+        )
+        print(f"[writing] targeted chapter {args.chapter} completed; full-book assembly is deferred", flush=True)
+        return 0
     continuity_report = {}
     ordered = sorted(results)
     for prev_n, curr_n in zip(ordered, ordered[1:]):
@@ -2004,9 +2674,18 @@ def main():
     full_path = assemble_full_book(out_dir, n_chapters)
     joined = open(full_path, encoding="utf-8").read()
     summ = engine.generate_cn_summary(joined, outline_text, direction)
-    if "error" not in summ:
-        open(os.path.join(out_dir, "summary_cn.md"), "w", encoding="utf-8").write(summ["content"])
-        print("    summary done")
+    if "error" in summ:
+        error = summ.get("error", "empty summary response")
+        print(f"[FAIL] cn summary generation failed: {error}", flush=True)
+        task_store.finish_run(
+            run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), error,
+        )
+        return 2
+    open(os.path.join(out_dir, "summary_cn.md"), "w", encoding="utf-8").write(summ["content"])
+    print("    summary done")
+    task_store.finish_run(
+        run_id, args.story_id, "writing", "completed", round(time.time() - run_started, 1), None,
+    )
     print(f"\nDONE: {out_dir}")
     return 0
 

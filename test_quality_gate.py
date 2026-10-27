@@ -1,6 +1,8 @@
 import hashlib
 import json
+import shutil
 import unittest
+import uuid
 from pathlib import Path
 
 import quality_gate
@@ -63,14 +65,34 @@ class QualityGateTests(unittest.TestCase):
         decision = quality_gate.chapter_acceptance_decision({"source_sha256": "x"}, "Mara waits.")
         self.assertEqual(decision["decision"], "verification_failed")
 
-    def test_blind_review_is_preserved_as_evidence(self):
+    def test_blind_review_is_preserved_only_as_an_observation(self):
         report = quality_gate.build_report(
-            "Her breath caught as the door opened.", 3,
+            "Mara waits.", 3,
             {"score": 3, "threshold": 4, "reason": "avoid stock reaction", "provider": "glm"},
         )
         self.assertEqual(report["blind_review"]["provider"], "glm")
-        self.assertEqual(report["decision"], "repair_required")
-        self.assertTrue(any(i["source"] == "blind_review" for i in report["issues"]))
+        self.assertEqual(report["decision"], "passed")
+        self.assertFalse(any(i["source"] == "blind_review" for i in report["issues"]))
+        self.assertTrue(any(i["source"] == "blind_review" for i in report["observations"]))
+
+    def test_legacy_blind_only_report_does_not_block_story_release(self):
+        text = "Mara waits."
+        root = Path(".quality-gate-summary-" + uuid.uuid4().hex)
+        root.mkdir()
+        try:
+            (root / "ch0001.md").write_text(text, encoding="utf-8")
+            (root / "ch0001.quality_gate.json").write_text(json.dumps({
+                "source_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "decision": "repair_required",
+                "issues": [{"source": "blind_review", "severity": "blocking"}],
+                "local_warnings": [],
+            }), encoding="utf-8")
+            summary = quality_gate.summarize_story(root)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        self.assertEqual(summary["repair_required"], [])
+        self.assertEqual(summary["review_required"], [])
+        self.assertTrue(summary["release_ready"])
 
     def test_local_finding_has_stable_anchor_and_id(self):
         text = "His pupils swallowed his irises."
@@ -78,6 +100,13 @@ class QualityGateTests(unittest.TestCase):
         second = quality_gate.build_report(text, 1, {"score": 5, "threshold": 4})
         self.assertEqual(first["issues"][0]["issue_id"], second["issues"][0]["issue_id"])
         self.assertEqual(first["issues"][0]["line_start"], 1)
+
+    def test_canonical_roster_is_checked_in_the_quality_report(self):
+        report = quality_gate.build_report(
+            "Mara Bell entered the ward.", 1, {}, canonical_names=["Mara Voss"]
+        )
+        self.assertTrue(any(item["rule_id"] == "unregistered-entity" for item in report["issues"]))
+        self.assertEqual(report["decision"], "repair_required")
 
     def test_state_diff_is_explicit_when_states_are_supplied(self):
         text = "A."
@@ -101,6 +130,16 @@ class QualityGateTests(unittest.TestCase):
         self.assertEqual(report["fact_diff"]["status"], "invalid")
         self.assertIn("current_state_source_hash_mismatch", report["fact_diff"]["changed"])
 
+    def test_adjacent_chapter_state_hashes_do_not_create_a_false_failure(self):
+        text = "Current chapter."
+        report = quality_gate.build_report(text, 2, {}, {
+            "chapter": 1, "source_sha256": "1" * 64, "validation_status": "passed",
+        }, {
+            "chapter": 2, "source_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "validation_status": "passed",
+        })
+        self.assertEqual(report["fact_diff"]["status"], "verified")
+        self.assertNotIn("chapter_state_advanced", report["fact_diff"]["changed"])
+
     def test_failed_state_delta_blocks_the_quality_gate(self):
         report = quality_gate.build_report(
             "A.", 1, {}, current_state={"validation_status": "failed"},
@@ -113,23 +152,24 @@ class QualityGateTests(unittest.TestCase):
         report = quality_gate.build_report("His pupils swallowed his irises.", 1, {"score": 5, "threshold": 4})
         self.assertEqual(report["decision"], "review_required")
 
-    def test_supernatural_reaction_review_blocks_with_exact_anchor(self):
+    def test_supernatural_reaction_review_is_an_observation_with_exact_anchor(self):
         text = "His nails lengthened. Elara felt only a pulse of interest."
         blind = {
             "reason": "supernatural_reaction: review\nsupernatural_reaction_evidence: Elara felt only a pulse of interest.",
         }
         report = quality_gate.build_report(text, 1, blind)
-        issue = next(item for item in report["issues"] if item["rule_id"] == "marketing-supernatural_reaction")
-        self.assertEqual(report["decision"], "repair_required")
-        self.assertEqual(issue["line_start"], 1)
+        observation = next(item for item in report["observations"] if item["rule_id"] == "marketing-supernatural_reaction")
+        self.assertEqual(report["decision"], "passed")
+        self.assertEqual(observation["line_start"], 1)
 
-    def test_relationship_basis_review_requires_editorial_review(self):
+    def test_relationship_basis_review_is_an_observation(self):
         text = "Mine, the bond seemed to say."
         blind = {
             "reason": "relationship_basis: review\nrelationship_basis_evidence: Mine, the bond seemed to say.",
         }
         report = quality_gate.build_report(text, 1, blind)
-        self.assertEqual(report["decision"], "review_required")
+        self.assertEqual(report["decision"], "passed")
+        self.assertTrue(any(item["rule_id"] == "marketing-relationship_basis" for item in report["observations"]))
 
     def test_marketing_review_strips_model_quote_marks_before_locating(self):
         text = "Elara felt only a pulse of interest."
@@ -137,9 +177,9 @@ class QualityGateTests(unittest.TestCase):
             "reason": "supernatural_reaction: review\nsupernatural_reaction_evidence: \"Elara felt only a pulse of interest.\"",
         }
         report = quality_gate.build_report(text, 1, blind)
-        issue = next(item for item in report["issues"] if item["rule_id"] == "marketing-supernatural_reaction")
-        self.assertEqual(issue["excerpt"], text)
-        self.assertNotIn("locator_status", issue)
+        observation = next(item for item in report["observations"] if item["rule_id"] == "marketing-supernatural_reaction")
+        self.assertEqual(observation["excerpt"], text)
+        self.assertNotIn("locator_status", observation)
 
     def test_report_round_trips_to_json(self):
         report = quality_gate.build_report("A.", 1, {})

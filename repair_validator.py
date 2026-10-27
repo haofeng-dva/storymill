@@ -3,6 +3,72 @@
 import hashlib
 import json
 import re
+from collections import Counter
+
+
+_CLOCK_TIME_RE = re.compile(
+    r"\b(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*(?:a\.?m\.?|p\.?m\.?))?(?=$|\W)", re.I,
+)
+_DURATION_RE = re.compile(
+    r"\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+    r"(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?)"
+    r"(?:\s*(?:,?\s*and|,)\s*(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+    r"(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?))?\b",
+    re.I,
+)
+
+
+def _normalize(value):
+    return " ".join(value.casefold().split())
+
+
+def _reference_validation_errors(before, after, repair_context):
+    """Reject local patches that break frozen facts or invent time precision."""
+    if repair_context is None:
+        return []
+    if not isinstance(repair_context, dict):
+        return ["repair reference context must be an object"]
+    errors = []
+    values = repair_context.get("frozen_literal_values", [])
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        return ["repair reference context has invalid frozen literal values"]
+    for value in values:
+        if value and value in before and value not in after:
+            errors.append(f"repair removed frozen fact literal: {value}")
+
+    policy = repair_context.get("temporal_policy", {})
+    if not isinstance(policy, dict):
+        return ["repair reference context has invalid temporal policy"]
+    approved_times = policy.get("approved_clock_times", [])
+    approved_durations = policy.get("approved_duration_phrases", [])
+    if not isinstance(approved_times, list) or not isinstance(approved_durations, list):
+        return ["repair reference context has invalid temporal approvals"]
+    if not all(isinstance(value, str) for value in approved_times + approved_durations):
+        return ["repair reference context has invalid temporal approvals"]
+    approved_times = {_normalize(value) for value in approved_times}
+    approved_durations = {_normalize(value) for value in approved_durations}
+    if policy.get("no_unapproved_clock_times", False):
+        prior_times = Counter(_normalize(found) for found in _CLOCK_TIME_RE.findall(before))
+        for found in _CLOCK_TIME_RE.findall(after):
+            normalized = _normalize(found)
+            if prior_times[normalized]:
+                prior_times[normalized] -= 1
+                continue
+            if normalized not in approved_times:
+                errors.append(f"repair contains unapproved clock time: {found}")
+    if policy.get("no_unapproved_more_precise_durations", False):
+        prior_durations = Counter(
+            _normalize(found) for found in _DURATION_RE.findall(before)
+        )
+        for found in _DURATION_RE.findall(after):
+            normalized = _normalize(found)
+            if prior_durations[normalized]:
+                prior_durations[normalized] -= 1
+                continue
+            is_more_precise = " and " in normalized or "," in found
+            if is_more_precise and normalized not in approved_durations:
+                errors.append(f"repair contains unapproved precise duration: {found}")
+    return errors
 
 def local_validate(before, after):
     errors = []
@@ -36,7 +102,7 @@ def _is_complete_paragraph(text, start, end):
     )
 
 
-def apply_scoped_patches(before, patches, allowed_anchors, insertion_anchors=()):
+def apply_scoped_patches(before, patches, allowed_anchors, insertion_anchors=(), repair_context=None):
     """Apply only verified replacements or small inserts at verified paragraphs.
 
     The model never chooses a free-form edit range: every ``find`` must be one
@@ -50,6 +116,12 @@ def apply_scoped_patches(before, patches, allowed_anchors, insertion_anchors=())
         "insertion_anchors": list(insertion_anchors or []),
         "patches": [],
     }
+    if repair_context is not None:
+        audit["repair_reference"] = {
+            "chapter": repair_context.get("chapter") if isinstance(repair_context, dict) else None,
+            "frozen_literal_values": repair_context.get("frozen_literal_values", []) if isinstance(repair_context, dict) else [],
+            "temporal_policy": repair_context.get("temporal_policy", {}) if isinstance(repair_context, dict) else {},
+        }
     if not isinstance(patches, list) or not patches:
         return {"accepted": False, "text": before, "audit": audit, "errors": ["repair returned no patches"]}
     anchors = {anchor for anchor in (allowed_anchors or []) if isinstance(anchor, str) and anchor}
@@ -148,7 +220,7 @@ def apply_scoped_patches(before, patches, allowed_anchors, insertion_anchors=())
             audit["patches"].append({"index": index, "insert_after": anchor, "insert": value})
     audit["patches"].reverse()
     audit["after_sha256"] = hashlib.sha256(after.encode("utf-8")).hexdigest()
-    validation_errors = local_validate(before, after)
+    validation_errors = local_validate(before, after) + _reference_validation_errors(before, after, repair_context)
     if validation_errors:
         return {"accepted": False, "text": before, "audit": audit, "errors": validation_errors}
     return {"accepted": True, "text": after, "audit": audit, "errors": []}

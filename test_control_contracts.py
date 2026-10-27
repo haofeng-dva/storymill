@@ -36,7 +36,7 @@ def valid_documents():
             "must_change": ["Mara accepts the contract."],
             "end_assertions": [{"id": "mara-signs", "claim": "Mara accepts the contract.", "required": True}],
             "must_not_regress": [{"id": "lab-closed", "claim": "The lab has already been closed.", "evidence_requirement": "Mara finds the sealed laboratory inaccessible."}],
-            "facts": [{"id": "lab_closed"}],
+            "facts": [{"id": "ch1-lab-status", "claim": "Laboratory status", "value": "sealed"}],
         }
     }
     ledger = metadata()
@@ -188,7 +188,7 @@ class ControlContractSchemaTests(unittest.TestCase):
     def test_context_budget_counts_utf8_bytes(self):
         self.assertEqual(validate_context_budget("a" * MAX_CONTEXT_BYTES), MAX_CONTEXT_BYTES)
         with self.assertRaisesRegex(ControlContractError, "limit"):
-            validate_context_budget("中" * 683)
+            validate_context_budget("中" * (MAX_CONTEXT_BYTES // 3 + 1))
 
     def test_missing_legacy_control_artifacts_are_reported_not_fabricated(self):
         missing_dir = Path(__file__).parent / "__no_control_artifacts_for_test__"
@@ -203,6 +203,24 @@ class ControlContractSchemaTests(unittest.TestCase):
         docs = valid_documents()
         docs["scene_ledger"]["chapters"]["0001"][0]["participants"] = ["Dr. Mara"]
         with self.assertRaisesRegex(ControlContractError, "exactly match"):
+            validate_cross_artifact_references(docs)
+
+    def test_contract_fact_requires_a_claim_and_literal_value(self):
+        doc = valid_documents()["chapter_contracts"]
+        del doc["chapters"]["0001"]["facts"][0]["value"]
+        with self.assertRaisesRegex(ControlContractError, "facts\[0\]\.value"):
+            validate_chapter_contracts(doc)
+
+    def test_cross_artifacts_require_every_declared_fact_to_have_a_matching_slot(self):
+        docs = valid_documents()
+        docs["scene_ledger"]["chapters"]["0001"][0]["fact_slots"] = []
+        with self.assertRaisesRegex(ControlContractError, "not covered"):
+            validate_cross_artifact_references(docs)
+
+    def test_cross_artifacts_require_every_scene_slot_to_be_declared_by_contract(self):
+        docs = valid_documents()
+        docs["chapter_contracts"]["chapters"]["0001"]["facts"] = []
+        with self.assertRaisesRegex(ControlContractError, "scene fact slot.*not declared"):
             validate_cross_artifact_references(docs)
 
 

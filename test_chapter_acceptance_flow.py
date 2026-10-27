@@ -51,6 +51,8 @@ class _FakeEngine(engine_module.WritingEngine):
     word_min = 10
     word_max = 10
     generated_extra_rules = []
+    compression_result = None
+    compression_calls = 0
 
     def __init__(self):
         self.cfg = {"paths": {"output": "shorts"}}
@@ -78,6 +80,10 @@ class _FakeEngine(engine_module.WritingEngine):
     def write_with_retry(self, *_args, **_kwargs):
         type(self).generated_extra_rules.append(_args[-1])
         return {"text": INITIAL_TEXT, "words": 10, "elapsed": 0, "rewrites": 0}
+
+    def compact_chapter_to_word_limit(self, _text, _minimum_words, _maximum_words, _protected_quotes):
+        type(self).compression_calls += 1
+        return {"content": type(self).compression_result, "words": 9}
 
     def ai_tell_check(self, _text):
         return [], {}
@@ -146,6 +152,11 @@ class _Judge:
         return 5, "verdict: human", "test"
 
 
+class _ExplodingJudge:
+    def __init__(self, *_args):
+        raise AssertionError("production writing must not instantiate QualityJudge")
+
+
 def _review(text, findings):
     return {
         "source_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -164,13 +175,17 @@ class ChapterAcceptanceFlowTests(unittest.TestCase):
         shutil.rmtree(self.root, ignore_errors=True)
 
     def _run_flow(self, reviews, chapters, repair_patches=None, repair_patch_batches=None,
-                  word_bounds=(10, 10), chapter_contracts=False, max_repair_rounds=1):
+                  word_bounds=(10, 10), chapter_contracts=False, max_repair_rounds=1,
+                  run_id=None, summary_result=None, judge_class=_Judge, compression_result=None):
         self.reviewed_names = []
         self.reviewed_requirements = []
         self.reviewed_ledgers = []
+        _FakeEngine.compression_result = compression_result
+        _FakeEngine.compression_calls = 0
         _FakeEngine.generated_extra_rules = []
 
-        def fake_review(name, text, _requirements, _reviewers, issue_ledger=None):
+        def fake_review(name, text, _requirements, _reviewers, issue_ledger=None,
+                        editorial_findings=True, contract_evidence_only=False):
             self.assertFalse((self.root / "shorts" / "flow" / "ch0001.md").exists())
             self.reviewed_names.append(name)
             self.reviewed_requirements.append(_requirements)
@@ -182,6 +197,7 @@ class ChapterAcceptanceFlowTests(unittest.TestCase):
              patch.object(_FakeLLM, "repair_patch_batches", repair_patch_batches), \
              patch.object(_FakeEngine, "word_min", word_bounds[0]), \
              patch.object(_FakeEngine, "word_max", word_bounds[1]), \
+             patch.object(_FakeEngine, "generate_cn_summary", return_value=summary_result or {"content": "test summary"}), \
              patch.object(engine_module, "WritingEngine", _FakeEngine), \
              patch.object(engine_module, "StateStore", return_value=self.store), \
              patch.object(engine_module, "BookMemory", _FakeBookMemory), \
@@ -189,12 +205,75 @@ class ChapterAcceptanceFlowTests(unittest.TestCase):
              patch.object(engine_module, "load_json", return_value={"chapter_acceptance": {"enabled": True, "max_repair_rounds": max_repair_rounds}}), \
              patch.object(engine_module, "load_lessons", return_value=[]), \
              patch.object(engine_module.progress, "update"), \
-             patch("native_check.QualityJudge", _Judge), \
+             patch("native_check.QualityJudge", judge_class), \
              patch("native_check.build_acceptance_reviewers", return_value=[]), \
              patch("native_check.extract_chapter_requirements", return_value=REQUIREMENTS), \
              patch("native_check.review_chapter_acceptance", side_effect=fake_review), \
-             patch.object(sys, "argv", ["engine.py", "--direction", "test", "--story-id", "flow", "--chapters", str(chapters), "--words", "10"] + (["--chapter-contracts"] if chapter_contracts else [])):
+             patch.object(sys, "argv", ["engine.py", "--direction", "test", "--story-id", "flow", "--chapters", str(chapters), "--words", "10"] + (["--chapter-contracts"] if chapter_contracts else []) + (["--run-id", run_id] if run_id else [])):
             return engine_module.main()
+
+    def test_production_flow_does_not_instantiate_blind_judge(self):
+        result = self._run_flow(
+            [lambda text: _review(text, [])], chapters=1,
+            judge_class=_ExplodingJudge,
+        )
+        self.assertEqual(result, 0)
+
+    def test_summary_failure_marks_the_run_failed_and_returns_nonzero(self):
+        result = self._run_flow(
+            [lambda text: _review(text, [])], chapters=1,
+            summary_result={"error": "summary provider unavailable"},
+        )
+
+        self.assertEqual(result, 2)
+        self.assertFalse((self.root / "shorts" / "flow" / "summary_cn.md").exists())
+        self.assertEqual(self.store.finished[-1][3], "failed")
+
+    def test_acceptance_history_is_retained_for_each_run(self):
+        for run_id in ("acceptance-run-one", "acceptance-run-two"):
+            result = self._run_flow([
+                lambda _text: {"error": "reviewer unavailable"},
+            ], chapters=1, run_id=run_id)
+            self.assertEqual(result, 2)
+
+        root = self.root / "out" / "flow" / "chapter_acceptance"
+        first = json.loads((root / "runs" / "acceptance-run-one" / "ch0001.json").read_text(encoding="utf-8"))
+        second = json.loads((root / "runs" / "acceptance-run-two" / "ch0001.json").read_text(encoding="utf-8"))
+        latest = json.loads((root / "ch0001.json").read_text(encoding="utf-8"))
+        self.assertEqual(first["run_id"], "acceptance-run-one")
+        self.assertEqual(second["run_id"], "acceptance-run-two")
+        self.assertEqual(latest["run_id"], "acceptance-run-two")
+
+    def test_acceptance_provider_timeout_is_recorded_as_infrastructure_failure(self):
+        result = self._run_flow([
+            lambda _text: {"error": "reviewer unavailable: TimeoutError: The read operation timed out"},
+        ], chapters=1)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(self.store.rows[1]["failure_type"], "upstream_timeout")
+
+    def test_multi_provider_acceptance_outage_is_not_labeled_as_the_last_fallback(self):
+        result = self._run_flow([
+            lambda _text: {
+                "error": "acceptance reviewer unavailable",
+                "provider_failures": [
+                    {"provider": "glm", "model": "glm-test", "failure_type": "upstream_timeout"},
+                    {"provider": "gpt", "model": "gpt-5.6-terra", "failure_type": "gateway_timeout"},
+                    {"provider": "gemini", "model": "gemini-test", "failure_type": "proxy_tls_error"},
+                ],
+            },
+        ], chapters=1)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(self.store.rows[1]["failure_type"], "acceptance_infrastructure_failure")
+        self.assertEqual(self.store.finished[-1][3], "failed_infra")
+        artifact = json.loads((
+            self.root / "out" / "flow" / "chapter_acceptance" / "ch0001.json"
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(
+            artifact["history"][0]["review"]["provider_failures"][1]["model"],
+            "gpt-5.6-terra",
+        )
 
     def test_repair_then_recheck_passes_before_writing_chapter(self):
         findings = [{
@@ -217,6 +296,35 @@ class ChapterAcceptanceFlowTests(unittest.TestCase):
         self.assertEqual(history[1]["gate"]["decision"], "passed")
         self.assertEqual(self.store.rows[1]["status"], ChapterStatus.COMPLETED.value)
         self.assertEqual(self.reviewed_names, ["ch0001.md", "ch0001.md"])
+
+    def test_length_only_overflow_uses_one_bounded_compaction_then_rechecks(self):
+        compacted = "Alpha beta gamma cited wrong eta theta iota kappa."
+
+        def accepted(text):
+            return {
+                "source_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "outcomes": [{
+                    "id": REQUIREMENTS[0]["id"], "status": "met",
+                    "evidence_quotes": ["Alpha beta gamma"],
+                }],
+                "findings": [],
+            }
+
+        result = self._run_flow(
+            [accepted, accepted], chapters=1, word_bounds=(8, 9),
+            compression_result=compacted,
+        )
+
+        chapter = self.root / "shorts" / "flow" / "ch0001.md"
+        artifact = self.root / "out" / "flow" / "chapter_acceptance" / "ch0001.json"
+        history = json.loads(artifact.read_text(encoding="utf-8"))["history"]
+        self.assertEqual(result, 0)
+        self.assertEqual(chapter.read_text(encoding="utf-8"), compacted)
+        self.assertEqual(_FakeEngine.compression_calls, 1)
+        self.assertEqual(history[0]["length_compaction"], {
+            "before_words": 10, "after_words": 9, "status": "accepted",
+        })
+        self.assertEqual(history[1]["gate"]["decision"], "passed")
 
     def test_unresolved_recheck_does_not_write_and_blocks_following_chapter(self):
         findings = [{

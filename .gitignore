@@ -27,3 +27,26 @@ _test*.py
 _strict_*.py
 _probe_*.py
 _diag_*.py
+
+# ===== Local runtime / generated workspaces =====
+.codex-runtime/
+.workbuddy/
+.chapter-acceptance-flow-*/
+.status-test-*/
+.quality-gate-summary-*/
+.runtime-test/
+runtime-hook/
+node_modules/
+tmp/
+tmp*/
+_tmp/
+_docx_tmp/
+_docx_render*/
+_incoming_*/
+
+# ===== Local experiments and browser bridges =====
+experiments/
+distill/
+inkitt/
+inkitt_bridge/
+inkitt_extension/

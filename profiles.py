@@ -11,6 +11,9 @@ profiles.py — 模型 + prompt 策略封装（可插拔"包"）
 路由原则（实测结论）：
   thinking 强模型（gemini-3.1-pro）→ minimal 包：约束反而拖累它，用精简 prompt
   轻量/普通模型（flash-lite / 3-flash-preview / deepseek）→ full 包：约束辅助完成
+
+中转分组可用模型（2026-10-16 实测 /v1/models）：gpt-5.6-sol、gpt-6-astra、gpt-6.1-sol、codex-auto-review(502)。
+旧名 gpt-5.6-terra 已下线，会返回 404 model_not_found。
 """
 
 WRITER_PROFILES = {
@@ -20,6 +23,30 @@ WRITER_PROFILES = {
         "mode": "thinking",
         "prompt_pack": "minimal",
         "max_tokens": 6000,
+    },
+    "gpt-5.6-sol": {
+        "backend": "relay",
+        "mode": "thinking",
+        "prompt_pack": "minimal",
+        "max_tokens": 4000,
+    },
+    "gpt-5.6-terra": {
+        "backend": "relay",
+        "mode": "thinking",
+        "prompt_pack": "minimal",
+        "max_tokens": 4000,
+    },
+    "gpt-6-astra": {
+        "backend": "relay",
+        "mode": "thinking",
+        "prompt_pack": "minimal",
+        "max_tokens": 4000,
+    },
+    "gpt-6.1-sol": {
+        "backend": "relay",
+        "mode": "thinking",
+        "prompt_pack": "minimal",
+        "max_tokens": 4000,
     },
     "gpt-5.5": {
         "backend": "relay",
@@ -59,6 +86,9 @@ WRITER_PROFILES = {
 REVIEWER_PROFILES = {
     "gemini-3.1-pro-preview": {"backend": "gemini", "mode": "thinking"},
     "glm-5-2-260617": {"backend": "ark", "mode": "reasoning"},
+    "gpt-5.6-sol": {"backend": "relay", "mode": "thinking"},
+    "gpt-6-astra": {"backend": "relay", "mode": "thinking"},
+    "gpt-6.1-sol": {"backend": "relay", "mode": "thinking"},
     "gpt-5.5": {"backend": "relay", "mode": "thinking"},
     "gpt-4.1": {"backend": "relay", "mode": "thinking"},
 }

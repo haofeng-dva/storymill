@@ -84,8 +84,9 @@ def get_status():
             if not os.path.isdir(d) or sid == "reports":
                 continue
             epub = [f for f in os.listdir(d) if f.endswith(".epub")]
+            plain_text = [f for f in os.listdir(d) if f.endswith(".txt")]
             has_manifest = os.path.exists(os.path.join(d, "publish_manifest.json"))
-            outputs.append({"storyId": sid, "epub": epub, "manifest": has_manifest})
+            outputs.append({"storyId": sid, "epub": epub, "plainText": plain_text, "manifest": has_manifest})
 
     # 已生成的故事（shorts/）
     stories = []
@@ -402,8 +403,8 @@ async function load() {
     : '<div class="empty">无待采纳推荐（先跑 radar）</div>';
   document.getElementById('outputs').innerHTML = s.outputs.length
     ? s.outputs.map(o => `<div class="row"><span>${o.storyId}</span><span class="tag">${
-        o.epub.map(f => `<a class="dl" href="/api/download?story=${o.storyId}&file=${f}">⬇ ${f}</a>`).join(' ')
-      } ${o.manifest ? `<a class="dl" href="/api/download?story=${o.storyId}&file=publish_manifest.json">⬇ 发布清单</a>` : ''}</span></div>`).join('')
+      o.epub.map(f => `<a class="dl" href="/api/download?story=${o.storyId}&file=${f}">⬇ ${f}</a>`).join(' ')
+      } ${o.plainText.map(f => `<a class="dl" href="/api/download?story=${o.storyId}&file=${f}">⬇ ${f}</a>`).join(' ')} ${o.manifest ? `<a class="dl" href="/api/download?story=${o.storyId}&file=publish_manifest.json">⬇ 发布清单</a>` : ''}</span></div>`).join('')
     : '<div class="empty">暂无产物（跑完生产+包装才有）</div>';
   document.getElementById('stories').innerHTML = s.stories.length
     ? s.stories.map(st => `<div class="row"><span>${st.storyId}</span><span class="tag">${st.chapters} 章 <a class="dl" href="javascript:void(0)" onclick="preview('${st.storyId}',1)">预览第一章</a></span></div>`).join('')

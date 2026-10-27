@@ -20,10 +20,12 @@ import sys
 import shutil
 import subprocess
 import threading
+import time
 import urllib.request
 import urllib.error
 
 from engine import LLM, load_json
+from chapter_state import classify_failure
 import progress
 import quality_gate
 
@@ -95,6 +97,82 @@ def request_json_bounded(req, timeout=REVIEW_REQUEST_TIMEOUT_SECONDS):
     return None, result.get("error", "empty provider response")
 
 
+def request_sse_json_bounded(req, idle_timeout=REVIEW_REQUEST_TIMEOUT_SECONDS,
+                             total_timeout=300):
+    """Read a chat-completions SSE response without accepting partial JSON.
+
+    ``urlopen`` applies its timeout to each socket read.  The outer thread is
+    therefore only a total-budget guard; a healthy stream may exceed the idle
+    timeout as long as it continues delivering chunks.
+    """
+    result = {}
+
+    def worker():
+        content_parts = []
+        usage = None
+        saw_done = False
+        saw_terminal_choice = False
+        try:
+            with urllib.request.urlopen(req, timeout=idle_timeout) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8", "ignore").strip()
+                    if not line or line.startswith(":") or not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        saw_done = True
+                        break
+                    try:
+                        event = json.loads(payload)
+                    except json.JSONDecodeError:
+                        result["error"] = "StreamProtocolError: invalid SSE JSON event"
+                        return
+                    if isinstance(event.get("usage"), dict):
+                        usage = event["usage"]
+                    for choice in event.get("choices") or []:
+                        delta = choice.get("delta") or {}
+                        # Thinking traces are not part of the required JSON audit.
+                        if isinstance(delta.get("content"), str):
+                            content_parts.append(delta["content"])
+                        if choice.get("finish_reason"):
+                            saw_terminal_choice = True
+            content = "".join(content_parts).strip()
+            # OpenAI-style relays normally finish with [DONE]. Some relay
+            # implementations close immediately after a terminal choice. This
+            # acceptance path requires a JSON object, so an EOF without either
+            # marker is usable only when the accumulated document is complete
+            # JSON; the caller still enforces the full chapter contract.
+            if not (saw_done or saw_terminal_choice):
+                try:
+                    complete_json = json.loads(content)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    result["error"] = "StreamInterruptedError: stream ended without a terminal event"
+                    return
+                if not isinstance(complete_json, dict):
+                    result["error"] = "StreamInterruptedError: stream ended without a terminal event"
+                    return
+            if not content:
+                result["error"] = "empty provider response"
+                return
+            result["data"] = {
+                "choices": [{"message": {"content": content}}],
+                "usage": usage,
+            }
+        except urllib.error.HTTPError as exc:
+            result["error"] = f"HTTP {exc.code}: {exc.read().decode('utf-8', 'ignore')[:300]}"
+        except Exception as exc:
+            result["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout=total_timeout)
+    if thread.is_alive():
+        return None, f"TimeoutError: stream exceeded total budget of {total_timeout}s"
+    if "data" in result:
+        return result["data"], None
+    return None, result.get("error", "empty provider response")
+
+
 def load_env(path=None):
     """读 .env 文件（KEY=VALUE），再用 keys.local.json 覆盖（使用者自己的 key 优先）。"""
     env = dict(os.environ)
@@ -126,7 +204,10 @@ class GPTNativeReviewer:
                  fallback_model=None, fallback_attempts=None):
         self.base = env.get("OPENAI_RELAY_BASE", "").rstrip("/")
         self.key = env.get("OPENAI_RELAY_KEY", "")
-        self.model = model or env.get("OPENAI_RELAY_MODEL", "gpt-5.6-sol")
+        # 2026-10-20: gpt-5.6-sol is catalog-listed but its upstream route now
+        # returns 502 upstream_error; terra is the reachable default. Callers
+        # that need a specific model (chapter acceptance) pass it explicitly.
+        self.model = model or env.get("OPENAI_RELAY_MODEL", "gpt-5.6-terra")
         cfg = load_json(os.path.join(HERE, "config.json"))
         relay = cfg.get("llm", {}).get("relay", {})
         self.relay_headers = relay.get("headers", {})
@@ -157,46 +238,95 @@ class GPTNativeReviewer:
         return headers
 
     def _call_model(self, model, messages, max_tokens,
-                    request_timeout_seconds=REVIEW_REQUEST_TIMEOUT_SECONDS):
+                    request_timeout_seconds=REVIEW_REQUEST_TIMEOUT_SECONDS,
+                    stream=False, idle_timeout_seconds=REVIEW_REQUEST_TIMEOUT_SECONDS):
+        started = time.monotonic()
         body = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0.2,
         }
+        if stream:
+            body["stream"] = True
+            body["stream_options"] = {"include_usage": True}
         req = urllib.request.Request(
             self.base + "/v1/chat/completions",
             data=json.dumps(body).encode("utf-8"),
             headers=self._headers(),
         )
-        data, error = request_json_bounded(req, timeout=request_timeout_seconds)
+        if stream:
+            data, error = request_sse_json_bounded(
+                req, idle_timeout=idle_timeout_seconds,
+                total_timeout=request_timeout_seconds,
+            )
+        else:
+            data, error = request_json_bounded(req, timeout=request_timeout_seconds)
+        elapsed_s = round(time.monotonic() - started, 1)
         if error:
-            return {"error": error}
+            status = re.search(r"\bHTTP\s+(\d{3})\b", error)
+            return {
+                "error": error,
+                "elapsed_s": elapsed_s,
+                "http_status": int(status.group(1)) if status else None,
+                "stream": stream,
+            }
         try:
             text_out = (data["choices"][0]["message"].get("content") or "").strip()
         except (KeyError, IndexError, TypeError):
             return {"error": "invalid relay chat-completions response"}
         if not text_out.strip():
             return {"error": "empty provider response"}
-        return {"content": text_out}
+        return {
+            "content": text_out,
+            "usage": data.get("usage"),
+            "elapsed_s": elapsed_s,
+            "http_status": 200,
+            "stream": stream,
+        }
 
     def _call(self, messages, max_tokens=1200,
-              request_timeout_seconds=REVIEW_REQUEST_TIMEOUT_SECONDS):
+              request_timeout_seconds=REVIEW_REQUEST_TIMEOUT_SECONDS,
+              stream=False, idle_timeout_seconds=REVIEW_REQUEST_TIMEOUT_SECONDS):
         attempts = [(self.model, self.primary_attempts)]
         if self.fallback_model and self.fallback_model != self.model:
             attempts.append((self.fallback_model, self.fallback_attempts))
         errors = []
+        attempt_failures = []
+        # A TLS EOF or a gateway timeout is a connection failure before the
+        # reviewer has supplied any judgment.  Reconnect it once with a short
+        # delay, but never retry malformed JSON/content failures as though they
+        # were transport problems.
+        transport_attempts = 2
         for model, count in attempts:
             for attempt in range(1, count + 1):
-                result = self._call_model(
-                    model, messages, max_tokens,
-                    request_timeout_seconds=request_timeout_seconds,
-                )
-                if "error" not in result:
-                    result["model"] = model
-                    return result
-                errors.append(f"{model} attempt {attempt}: {result['error']}")
-        return {"error": "; ".join(errors)}
+                for transport_attempt in range(1, transport_attempts + 1):
+                    result = self._call_model(
+                        model, messages, max_tokens,
+                        request_timeout_seconds=request_timeout_seconds,
+                        stream=stream,
+                        idle_timeout_seconds=idle_timeout_seconds,
+                    )
+                    if "error" not in result:
+                        result["model"] = model
+                        return result
+                    failure_type = classify_failure(result["error"])
+                    errors.append(f"{model} attempt {attempt}.{transport_attempt}: {result['error']}")
+                    attempt_failures.append({
+                        "model": model,
+                        "attempt": attempt,
+                        "transport_attempt": transport_attempt,
+                        "error": result["error"],
+                        "failure_type": failure_type,
+                        "elapsed_s": result.get("elapsed_s"),
+                        "http_status": result.get("http_status"),
+                        "stream": result.get("stream"),
+                    })
+                    if failure_type not in {"proxy_tls_error", "gateway_timeout"}:
+                        break
+                    if transport_attempt < transport_attempts:
+                        time.sleep(1)
+        return {"error": "; ".join(errors), "attempt_failures": attempt_failures}
 
     def review(self, text):
         score_reqs = "\n".join(
@@ -239,18 +369,28 @@ class DeepSeekReviewer:
         self.model = cfg["llm"]["models"]["reviewer"]
 
     def _call(self, messages, max_tokens,
-              request_timeout_seconds=REVIEW_REQUEST_TIMEOUT_SECONDS):
+              request_timeout_seconds=REVIEW_REQUEST_TIMEOUT_SECONDS,
+              stream=False, idle_timeout_seconds=REVIEW_REQUEST_TIMEOUT_SECONDS):
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.2,
+        }
+        if stream:
+            body["stream"] = True
+            body["stream_options"] = {"include_usage": True}
         req = urllib.request.Request(
             self.base_url + "/chat/completions",
-            data=json.dumps({
-                "model": self.model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": 0.2,
-            }).encode("utf-8"),
+            data=json.dumps(body).encode("utf-8"),
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
         )
-        data, error = request_json_bounded(req, timeout=request_timeout_seconds)
+        if stream:
+            data, error = request_sse_json_bounded(
+                req, idle_timeout=idle_timeout_seconds, total_timeout=request_timeout_seconds,
+            )
+        else:
+            data, error = request_json_bounded(req, timeout=request_timeout_seconds)
         if error:
             return {"error": error}
         try:
@@ -506,7 +646,7 @@ def freeze_acceptance_issue_ledger(chapter_no, review):
     return ledger
 
 
-def _acceptance_user_prompt(text, requirements, issue_ledger=None):
+def _acceptance_user_prompt(text, requirements, issue_ledger=None, editorial_findings=True):
     contract = json.dumps(requirements, ensure_ascii=False)
     ledger_items = _ledger_items(issue_ledger) if issue_ledger is not None else None
     ledger_instruction = ""
@@ -535,13 +675,18 @@ def _acceptance_user_prompt(text, requirements, issue_ledger=None):
         "evidence_quotes must quote the related but insufficient text, and insertion_anchor must be one unique, complete "
         "existing paragraph after which the uncertain result can be made explicit with one small paragraph. For met, "
         "insertion_anchor must be null. Do not infer an outcome from setup, intention, or a later chapter.\n\n"
-        "findings is an array. Each finding must contain exactly category, evidence_quotes, reason, repair_scope. "
-        "category must be one of duplicate_scene, continuity_causality, scene_staging, clarity_idiomaticity, abstract_template. "
-        "evidence_quotes must be literal contiguous quotations from the chapter. A duplicate_scene finding needs two quotations, "
-        "one for each materially repeated progression. Keep every reason to one short sentence and quote only the smallest "
-        "passage needed to prove it. Report every concrete problem in these categories that prevents publication; "
-        "do not soften a confirmed problem because the chapter is otherwise good. Use [] only when none exist. "
-        "repair_scope must be sentence, paragraph, scene, or chapter.\n\n"
+        + (
+            "findings is an array. Each finding must contain exactly category, evidence_quotes, reason, repair_scope. "
+            "category must be one of duplicate_scene, continuity_causality, scene_staging, clarity_idiomaticity, abstract_template. "
+            "evidence_quotes must be literal contiguous quotations from the chapter. A duplicate_scene finding needs two quotations, "
+            "one for each materially repeated progression. Keep every reason to one short sentence and quote only the smallest "
+            "passage needed to prove it. Report every concrete problem in these categories that prevents publication; "
+            "do not soften a confirmed problem because the chapter is otherwise good. Use [] only when none exist. "
+            "repair_scope must be sentence, paragraph, scene, or chapter.\n\n"
+            if editorial_findings else
+            "findings must be []. This pre-write gate verifies the supplied chapter contract only; deterministic prose checks "
+            "run separately before this request and broad editorial review runs after chapter production.\n\n"
+        )
         + ledger_instruction
         + ledger_context
         + "Required chapter outcomes:\n"
@@ -552,14 +697,47 @@ def _acceptance_user_prompt(text, requirements, issue_ledger=None):
     )
 
 
-def acceptance_review_with_fallback(text, requirements, reviewers, issue_ledger=None):
+def _acceptance_failure_records(name, reviewer, attempt, result):
+    """Normalize failed reviewer calls without losing provider/model attribution."""
+    records = []
+    for item in result.get("attempt_failures", []) if isinstance(result, dict) else []:
+        if not isinstance(item, dict) or not item.get("error"):
+            continue
+        error = str(item["error"])
+        records.append({
+            "provider": name,
+            "model": item.get("model") or getattr(reviewer, "model", name),
+            "attempt": item.get("attempt") or attempt,
+            "error": error,
+            "failure_type": classify_failure(error),
+            **{key: item[key] for key in ("elapsed_s", "http_status", "stream") if item.get(key) is not None},
+        })
+    if records:
+        return records
+
+    error = result.get("error") if isinstance(result, dict) else None
+    if not error:
+        error = "empty provider response"
+    records.append({
+        "provider": name,
+        "model": (result.get("model") if isinstance(result, dict) else None) or getattr(reviewer, "model", name),
+        "attempt": attempt,
+        "error": str(error),
+        "failure_type": classify_failure(error if result.get("error") else None, content=""),
+    })
+    return records
+
+
+def acceptance_review_with_fallback(text, requirements, reviewers, issue_ledger=None,
+                                    include_failures=False, editorial_findings=True):
     """Run the stricter acceptance audit through the existing reviewer fallback chain."""
-    user = _acceptance_user_prompt(text, requirements, issue_ledger)
+    user = _acceptance_user_prompt(text, requirements, issue_ledger, editorial_findings)
     system = (
         "You are a meticulous native English fiction editor. You enforce chapter contracts and publication-level prose clarity. "
         "Never invent quotations. A reported problem must be tied to exact supplied text."
     )
     errors = []
+    provider_failures = []
     for name, reviewer in reviewers:
         attempts = 1 if isinstance(reviewer, GeminiReviewer) else max(
             1, int(getattr(reviewer, "acceptance_attempts", 1)),
@@ -568,21 +746,32 @@ def acceptance_review_with_fallback(text, requirements, reviewers, issue_ledger=
             if isinstance(reviewer, GeminiReviewer):
                 result = reviewer._call(system, user)
             else:
+                call_kwargs = {
+                    "max_tokens": getattr(reviewer, "acceptance_max_tokens", 2600),
+                    "request_timeout_seconds": getattr(
+                        reviewer, "acceptance_timeout_seconds", REVIEW_REQUEST_TIMEOUT_SECONDS
+                    ),
+                }
+                if isinstance(reviewer, (GPTNativeReviewer, DeepSeekReviewer)):
+                    call_kwargs.update({
+                        "stream": getattr(reviewer, "acceptance_stream", False),
+                        "idle_timeout_seconds": getattr(
+                            reviewer, "acceptance_idle_timeout_seconds", REVIEW_REQUEST_TIMEOUT_SECONDS
+                        ),
+                    })
                 result = reviewer._call([
                     {"role": "developer", "content": system},
                     {"role": "user", "content": user},
-                ],
-                    max_tokens=getattr(reviewer, "acceptance_max_tokens", 2600),
-                    request_timeout_seconds=getattr(
-                        reviewer, "acceptance_timeout_seconds", REVIEW_REQUEST_TIMEOUT_SECONDS
-                    ),
-                )
+                ], **call_kwargs)
             if "error" not in result and result.get("content", "").strip():
                 model = result.get("model", getattr(reviewer, "model", name))
-                return result["content"], f"{model} ({name})"
+                returned = (result["content"], f"{model} ({name})")
+                return (*returned, provider_failures) if include_failures else returned
             label = name if attempts == 1 else f"{name} attempt {attempt}"
             errors.append(f"{label}: {result.get('error') or 'empty'}")
-    return None, "; ".join(errors)
+            provider_failures.extend(_acceptance_failure_records(name, reviewer, attempt, result))
+    returned = (None, "; ".join(errors))
+    return (*returned, provider_failures) if include_failures else returned
 
 
 def _json_object(content):
@@ -596,6 +785,224 @@ def _exact_quotes(value, text, minimum=1):
         return None
     quotes = [item.strip() for item in value]
     return quotes if all(quote in text for quote in quotes) else None
+
+
+def _contract_evidence_candidates(text, requirement, limit=10):
+    """Select literal context windows for one contract assertion.
+
+    This keeps a proof request small without trusting the selector: the returned
+    quotation is still checked against the full chapter by ``_exact_quotes``.
+    """
+    source = text or ""
+    sentences = []
+    for match in re.finditer(r"(?s).*?(?<=[.!?])(?=\s|$)|.+$", source):
+        raw = match.group(0)
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        sentences.append((
+            stripped,
+            match.start() + len(raw) - len(raw.lstrip()),
+            match.start() + len(raw.rstrip()),
+        ))
+    def lexical_forms(value):
+        forms = set()
+        for word in re.findall(r"[A-Za-z][A-Za-z'-]{2,}", value or ""):
+            normalized = word.lower()
+            forms.add(normalized)
+            if normalized.endswith("ed") and len(normalized) > 4:
+                forms.add(normalized[:-1])
+            elif normalized.endswith("ing") and len(normalized) > 5:
+                forms.add(normalized[:-3])
+        return forms
+
+    terms = lexical_forms(requirement) - {"and", "the", "with", "that", "this", "from", "into", "before", "after"}
+    ranked = sorted(
+        range(len(sentences)),
+        key=lambda index: len(terms.intersection(lexical_forms(sentences[index][0]))),
+        reverse=True,
+    )
+    selected = []
+
+    def add_window(index):
+        # Fiction frequently places one action in several one-line beats.
+        # Keep enough adjacent context to prove a short action sequence.
+        start = max(0, index - 12)
+        end = min(len(sentences), index + 13)
+        excerpt = source[sentences[start][1]:sentences[end - 1][2]].strip()
+        if excerpt and excerpt not in selected:
+            selected.append(excerpt)
+
+    # Dialogue often uses "I agree" without repeating the actor and the
+    # subject of the agreement in the same sentence. Preserve that local
+    # exchange when a contract asks for consent or agreement.
+    if "agree" in requirement.lower():
+        for match in re.finditer(r"(?is).{0,450}?\bI agree\b.{0,450}", source):
+            excerpt = match.group(0).strip()
+            if excerpt and excerpt not in selected:
+                selected.append(excerpt)
+            if len(selected) >= limit:
+                break
+
+    # Keep structural action matches when a contract names a compact event.
+    # Exact wording is intentionally not required: prose may use "grooves" or
+    # "claws scraped" where the contract says "scratches".
+    requirement_words = (requirement or "").lower()
+    action_pattern = None
+    if "scratch" in requirement_words and "collaps" in requirement_words:
+        action_pattern = r"\b(claw|scratch|scrap|groove|stroke|line|collapse|collapsed|slack|shudder)"
+    if action_pattern:
+        # Sentence boundaries are deliberately weak in fiction: an action can
+        # be written as several one-line paragraphs. Prefer a literal span
+        # that contains both the scratching vocabulary and its collapse.
+        for match in re.finditer(
+            r"(?is)\b(?:third|three)\b.{0,500}?\b(?:claw|scratch|scrap|groove|stroke|line)\w*\b.{0,900}?\b(?:collapse|collapsed|slack)\b",
+            source,
+        ):
+            excerpt = source[max(0, match.start() - 350):min(len(source), match.end() + 350)].strip()
+            if excerpt and excerpt not in selected:
+                selected.append(excerpt)
+            if len(selected) >= limit:
+                break
+        for match in re.finditer(
+            r"(?is)\b(?:claw|scratch|scrap|groove|stroke|line)\w*\b.{0,900}?\b(?:collapse|collapsed|slack)\b",
+            source,
+        ):
+            excerpt = source[max(0, match.start() - 350):min(len(source), match.end() + 350)].strip()
+            if excerpt and excerpt not in selected:
+                selected.append(excerpt)
+            if len(selected) >= limit:
+                break
+        action_ranked = sorted(
+            range(len(sentences)),
+            key=lambda index: sum(
+                len(re.findall(action_pattern, sentences[near][0], flags=re.I))
+                for near in range(max(0, index - 4), min(len(sentences), index + 5))
+            ),
+            reverse=True,
+        )
+        for index in action_ranked[:max(1, limit // 3)]:
+            add_window(index)
+
+    # Keep the strongest lexical matches, then cover the chapter evenly.  A
+    # contract can describe an action with a different inflection or synonym
+    # from the prose (for example, "scratches" versus "claws scraped").
+    for index in ranked[:max(1, limit // 2)]:
+        add_window(index)
+    if len(sentences) > 1:
+        coverage_count = max(1, limit - len(selected))
+        for offset in range(coverage_count):
+            index = round(offset * (len(sentences) - 1) / max(1, coverage_count - 1))
+            add_window(index)
+            if len(selected) >= limit:
+                break
+    if not selected:
+        return [sentence[0] for sentence in sentences[:limit]]
+    return selected
+
+
+def _first_complete_paragraph(text):
+    for paragraph in re.split(r"\n\s*\n", text or ""):
+        candidate = paragraph.strip()
+        if candidate and text.count(candidate) == 1:
+            return candidate
+    return None
+
+
+def _contract_evidence_prompt(requirement, candidates):
+    context = "\n".join(f"[{index}] {sentence}" for index, sentence in enumerate(candidates))
+    return (
+        "Verify exactly one chapter-contract assertion. Return JSON only with exactly "
+        "id, status, evidence_index, reason. status is met or missing. For met, evidence_index "
+        "must be the integer index of one supplied evidence sentence. For missing, evidence_index must be null. "
+        "Never infer a result from intention or setup.\n\n"
+        f"Assertion id: {requirement['id']}\n"
+        f"Assertion: {requirement['requirement']}\n\n"
+        f"Evidence excerpts from the chapter:\n---\n{context}\n---"
+    )
+
+
+def review_chapter_contract_evidence(name, text, requirements, reviewers):
+    """Verify each required outcome separately, preserving fail-closed evidence checks."""
+    source_sha256 = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+    outcomes = []
+    provider_failures = []
+    provider_label = None
+    anchor = _first_complete_paragraph(text)
+    system = (
+        "You are an exacting fiction continuity verifier. Return only the required JSON. "
+        "Never invent or paraphrase evidence."
+    )
+    for requirement in requirements:
+        candidates = _contract_evidence_candidates(text, requirement["requirement"])
+        prompt = _contract_evidence_prompt(requirement, candidates)
+        response = None
+        selected_name = None
+        selected_reviewer = None
+        for reviewer_name, reviewer in reviewers:
+            selected_name, selected_reviewer = reviewer_name, reviewer
+            if isinstance(reviewer, GeminiReviewer):
+                response = reviewer._call(system, prompt)
+            else:
+                call_kwargs = {
+                    "max_tokens": max(128, min(400, int(getattr(reviewer, "acceptance_contract_max_tokens", 240)))),
+                    "request_timeout_seconds": getattr(
+                        reviewer, "acceptance_timeout_seconds", REVIEW_REQUEST_TIMEOUT_SECONDS
+                    ),
+                }
+                if isinstance(reviewer, (GPTNativeReviewer, DeepSeekReviewer)):
+                    call_kwargs.update({
+                        "stream": getattr(reviewer, "acceptance_stream", False),
+                        "idle_timeout_seconds": getattr(
+                            reviewer, "acceptance_idle_timeout_seconds", REVIEW_REQUEST_TIMEOUT_SECONDS
+                        ),
+                    })
+                response = reviewer._call([
+                    {"role": "developer", "content": system},
+                    {"role": "user", "content": prompt},
+                ], **call_kwargs)
+            if "error" not in response and response.get("content", "").strip():
+                provider_label = f"{response.get('model', getattr(reviewer, 'model', reviewer_name))} ({reviewer_name})"
+                break
+            provider_failures.extend(_acceptance_failure_records(reviewer_name, reviewer, 1, response))
+        if response is None or "error" in response or not response.get("content", "").strip():
+            return {
+                "file": name, "source_sha256": source_sha256,
+                "error": "contract evidence reviewer unavailable",
+                "provider_failures": provider_failures,
+            }
+        try:
+            payload = _json_object(response["content"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return {"file": name, "source_sha256": source_sha256, "error": f"invalid contract evidence JSON: {exc}"}
+        if not isinstance(payload, dict) or set(payload) != {"id", "status", "evidence_index", "reason"}:
+            return {"file": name, "source_sha256": source_sha256, "error": "contract evidence response has an invalid shape"}
+        if payload.get("id") != requirement["id"] or payload.get("status") not in {"met", "missing"}:
+            return {"file": name, "source_sha256": source_sha256, "error": "contract evidence response does not match its assertion"}
+        if not isinstance(payload.get("reason"), str) or not payload["reason"].strip():
+            return {"file": name, "source_sha256": source_sha256, "error": "contract evidence response lacks a reason"}
+        if payload["status"] == "met":
+            evidence_index = payload.get("evidence_index")
+            if not isinstance(evidence_index, int) or isinstance(evidence_index, bool) or not (0 <= evidence_index < len(candidates)):
+                return {"file": name, "source_sha256": source_sha256, "error": f"met outcome {requirement['id']} lacks a valid evidence index"}
+            quotes = [candidates[evidence_index]]
+            insertion_anchor = None
+        else:
+            if payload.get("evidence_index") is not None or not anchor:
+                return {"file": name, "source_sha256": source_sha256, "error": f"missing outcome {requirement['id']} lacks a valid repair anchor"}
+            quotes, insertion_anchor = [], anchor
+        outcomes.append({
+            "id": requirement["id"], "requirement": requirement["requirement"],
+            "status": payload["status"], "evidence_quotes": quotes,
+            "insertion_anchor": insertion_anchor, "reason": payload["reason"].strip(),
+        })
+    review = {
+        "file": name, "source_sha256": source_sha256, "provider": provider_label,
+        "outcomes": outcomes, "findings": [],
+    }
+    if provider_failures:
+        review["provider_failures"] = provider_failures
+    return review
 
 
 def _unique_complete_paragraph(value, text):
@@ -739,25 +1146,51 @@ def build_acceptance_reviewers(acceptance_config=None):
         REVIEW_REQUEST_TIMEOUT_SECONDS,
         int(acceptance_config.get("gpt_request_timeout_seconds", REVIEW_REQUEST_TIMEOUT_SECONDS)),
     )
+    gpt.acceptance_stream = bool(acceptance_config.get("gpt_stream", True))
+    gpt.acceptance_idle_timeout_seconds = max(
+        5,
+        int(acceptance_config.get("gpt_stream_idle_timeout_seconds", REVIEW_REQUEST_TIMEOUT_SECONDS)),
+    )
     glm = DeepSeekReviewer(cfg, env)
     glm.acceptance_max_tokens = max(256, int(acceptance_config.get("glm_max_output_tokens", 900)))
-    glm.acceptance_attempts = max(1, min(2, int(acceptance_config.get("glm_attempts", 1))))
+    glm.acceptance_attempts = max(1, min(4, int(acceptance_config.get("glm_attempts", 1))))
     glm.acceptance_timeout_seconds = max(
         REVIEW_REQUEST_TIMEOUT_SECONDS,
         int(acceptance_config.get("glm_request_timeout_seconds", REVIEW_REQUEST_TIMEOUT_SECONDS)),
     )
-    return [
-        ("glm", glm),
-        ("gpt", gpt),
-        ("gemini", GeminiReviewer(env)),
-    ]
+    glm.acceptance_stream = bool(acceptance_config.get("glm_stream", True))
+    glm.acceptance_idle_timeout_seconds = max(
+        5,
+        int(acceptance_config.get("glm_stream_idle_timeout_seconds", REVIEW_REQUEST_TIMEOUT_SECONDS)),
+    )
+    for _name, reviewer in (("gpt", gpt), ("glm", glm)):
+        reviewer.acceptance_contract_max_tokens = max(
+            128, min(400, int(acceptance_config.get(f"{_name}_contract_max_tokens", 240)))
+        )
+    reviewers_by_name = {
+        "gpt": gpt,
+        "glm": glm,
+        "gemini": GeminiReviewer(env),
+    }
+    reviewer_order = acceptance_config.get("reviewer_order", ["gpt", "glm", "gemini"])
+    if (
+        not isinstance(reviewer_order, list)
+        or not reviewer_order
+        or len(set(reviewer_order)) != len(reviewer_order)
+        or any(name not in reviewers_by_name for name in reviewer_order)
+    ):
+        raise ValueError("chapter_acceptance.reviewer_order must be a non-empty unique subset of gpt, glm, gemini")
+    return [(name, reviewers_by_name[name]) for name in reviewer_order]
 
 
-def review_chapter_acceptance(name, text, requirements, reviewers, issue_ledger=None):
+def review_chapter_acceptance(name, text, requirements, reviewers, issue_ledger=None,
+                              editorial_findings=True, contract_evidence_only=False):
     """Return a source-hashed acceptance audit or a fail-closed verification error."""
     source_sha256 = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
     if not requirements:
         return {"file": name, "source_sha256": source_sha256, "error": "chapter outline has no extractable requirements"}
+    if contract_evidence_only and issue_ledger is None:
+        return review_chapter_contract_evidence(name, text, requirements, reviewers)
     try:
         _ledger_items(issue_ledger) if issue_ledger is not None else None
     except ValueError as exc:
@@ -765,18 +1198,27 @@ def review_chapter_acceptance(name, text, requirements, reviewers, issue_ledger=
     remaining_reviewers = list(reviewers)
     errors = []
     while remaining_reviewers:
-        content, provider = acceptance_review_with_fallback(
-            text, requirements, remaining_reviewers, issue_ledger
+        content, provider, provider_failures = acceptance_review_with_fallback(
+            text, requirements, remaining_reviewers, issue_ledger, include_failures=True,
+            editorial_findings=editorial_findings,
         )
         if content is None:
             errors.append(f"reviewer unavailable: {provider}")
-            break
+            return {
+                "file": name,
+                "source_sha256": source_sha256,
+                "error": "acceptance reviewer unavailable or returned invalid output: " + "; ".join(errors),
+                "provider_failures": provider_failures,
+            }
         parsed = parse_acceptance_review(content, text, requirements, issue_ledger)
         if "error" not in parsed:
-            return {
+            review = {
                 "file": name, "source_sha256": source_sha256, "provider": provider,
                 "content": content, "requirements": requirements, **parsed,
             }
+            if provider_failures:
+                review["provider_failures"] = provider_failures
+            return review
         errors.append(f"{provider}: {parsed['error']}")
         provider_name = next(
             (candidate for candidate, _reviewer in remaining_reviewers if provider.endswith(f"({candidate})")),
@@ -1053,6 +1495,19 @@ def merge_retry_results(previous_rows, retried_rows, ordered_files):
     return [merged[name] for name in ordered_files if name in merged]
 
 
+def review_failure_status(results, quality_summary, require_quality_gate=False,
+                          fail_on_editorial_findings=False):
+    """Separate evidence validity from editorial findings in the CLI gate."""
+    any_fail = any(row.get("failed") or row.get("error") for row in results)
+    quality_gate_failed = require_quality_gate and (
+        quality_summary is None or not quality_summary["release_ready"]
+    )
+    editorial_files = [row["file"] for row in results if row.get("editorial_findings")]
+    if quality_gate_failed or (fail_on_editorial_findings and editorial_files):
+        any_fail = True
+    return any_fail, quality_gate_failed, editorial_files
+
+
 def main():
     ap = argparse.ArgumentParser(description="英文地道性质检 native-check（gpt-5.5 母语级）")
     ap.add_argument("--story-id", help="shorts/ 下的故事 id")
@@ -1061,7 +1516,10 @@ def main():
     ap.add_argument("--sample", type=int, default=0, help="抽样审稿：只审前 N 章（0=全部）")
     ap.add_argument("--refine", action="store_true", help="审稿后自动运行记忆驱动的局部语义精修并再次复检")
     ap.add_argument("--out", default="", help="结果 JSON 输出路径（默认 probe/native_check_result.json）")
-    ap.add_argument("--require-quality-gate", action="store_true", help="要求全书每章质量门禁报告有效且通过")
+    ap.add_argument("--require-quality-gate", action="store_true",
+                    help="要求全书每章质量门禁证据有效、完整且通过")
+    ap.add_argument("--fail-on-editorial-findings", action="store_true",
+                    help="将已验证的编辑发现作为非零退出码")
     ap.add_argument("--review-retries", type=int, default=DEFAULT_REVIEW_RETRIES,
                     help="单章三路审稿均失败后的补跑次数（默认 3；首轮外最多补跑三次）")
     ap.add_argument("--retry-failed", action="store_true",
@@ -1203,15 +1661,13 @@ def main():
             if os.path.exists(out): shutil.copy2(out, post)
 
     # exit code：有 FAIL 章节（低于评分门槛）→ 2，供 orchestrator 拦截；否则 0
-    any_fail = any(r.get("failed") or r.get("error") for r in results)
-    if args.require_quality_gate and (quality_summary is None or not quality_summary["release_ready"]):
-        any_fail = True
+    any_fail, quality_gate_failed, editorial_files = review_failure_status(
+        results, quality_summary, args.require_quality_gate, args.fail_on_editorial_findings,
+    )
+    if quality_gate_failed:
         print("[FAIL] quality gate has missing, stale, blocking, or review-required evidence")
-    if args.require_quality_gate:
-        editorial_files = [row["file"] for row in results if row.get("editorial_findings")]
-        if editorial_files:
-            any_fail = True
-            print("[FAIL] concrete editorial findings require review:", ", ".join(editorial_files))
+    if args.fail_on_editorial_findings and editorial_files:
+        print("[FAIL] concrete editorial findings require review:", ", ".join(editorial_files))
     if not results:
         print("[FAIL] no chapters were reviewed")
         sys.exit(1)

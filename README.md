@@ -1,119 +1,64 @@
-# 英文短篇全自动生产线 v1.0
+# Storymill
 
-基于 AI 的英文短篇小说批量生产系统。从题材选品到成稿包装，全自动闭环，附 Web 看板供人为介入。
+**An AI-assisted English short-fiction production and quality-control engine.** Storymill connects story discovery, planning, chapter generation, acceptance checks, issue tracking, repair workflows, and EPUB packaging in a resumable Python application.
 
-## 系统架构
+This project is archived as an engineering portfolio as of October 27, 2026. The repository documents both implemented workflows and the limits still found in real production runs. A generated manuscript or a passing test suite is not treated as proof of publication readiness.
 
-```
-radar.py            选品：女性向多源榜单（默认 Wattpad/Inkitt/WebNovel/Amazon；Royal Road 可选）→ 跨平台信号 → 推荐入库
-direction_manager   方向：采纳推荐 → 生成方向文件
-engine.py           写作：方向 → 大纲 → world bible → 分章(字数硬校验) → 中文摘要
-native_check.py     质检：Gemini 母语级审稿(地道+精彩双维度) + 搭配检查
-packager.py         包装：发布清单 + EPUB
-orchestrator.py     调度：全流程编排 + 日产能/token 限流 + 日结报告
-dashboard.py        看板：Web 前端 + 人为介入
-progress.py         监测：中间流程进度
-blind_review.py     盲评：母语级评委分辨 AI/真人
-batch_produce.py    量产：并行生产多部
-profiles.py         模型封装：每个模型 + 对应 prompt 包 + 自动路由
-state_store.py      SQLite 状态库
-```
+## What it does
 
-## 依赖与配置
+- Collects market signals and stores story recommendations for human selection.
+- Generates an outline and world bible, then writes chapters through configurable model providers.
+- Tracks run and chapter state, model calls, retries, errors, and resumable work in SQLite.
+- Compiles chapter contracts, scene plans, fact slots, and character voice guidance.
+- Separates deterministic text checks from model-based editorial review.
+- Keeps anchored repair cards, source hashes, revisions, and recheck status.
+- Packages manuscripts and supporting metadata as EPUB and delivery manifests.
+- Provides a local dashboard for operator review and intervention.
 
-- Python 3.13（标准库为主，无第三方依赖）
-- 模型：火山方舟（写作 deepseek-v4-flash / 审稿 glm-5-2）+ Gemini 3.1-pro（母语级审稿，需代理）
-- 配置：`config.json`（模型）、`orchestrator.json`（限流/开关）、`.env`（密钥）、`ai_tells_en.json`（AI味词表）
+## Architecture
 
-`.env` 需配置：
-```
-OPENAI_RELAY_KEY / OPENAI_RELAY_BASE / OPENAI_RELAY_MODEL   # GPT中转(可选)
-GEMINI_API_KEY / GEMINI_MODEL / GEMINI_PROXY                # Gemini母语级审稿(需代理)
+```text
+radar.py / direction_manager.py  discovery and story selection
+engine.py                        outline, world bible, chapter writing and acceptance
+control_*.py / story_bible*.py   chapter contracts, continuity and fact checks
+quality_*.py / native_check.py  deterministic checks and editorial review
+repair_*.py / final_editor*.py  anchored repair and final-candidate verification
+orchestrator.py / state_store.py resumable runs, scheduling and call audit
+packager.py / dashboard.py      delivery artifacts and operator interface
+test_*.py                        regression and contract tests
 ```
 
-## 快速开始
+## Evidence snapshot
 
-### 全自动跑一部（一条命令）
+- Current working tree: 69 non-test Python files, 30 test files, approximately 20,730 Python lines.
+- Current regression run: 375 tests passed with `py -3 -m unittest discover -p "test_*.py"`; existing `ResourceWarning` messages remain.
+- A documented production sample contains 12 chapters and approximately 30,474 words. A later editorial assessment recorded 19 issue groups and about 45 text-level issues, so it was not considered ready for release.
+- Three local portfolio runs contain complete 12-chapter manuscripts of roughly 30,000 words each. Their story text and runtime artifacts are excluded from this repository.
+- A historical long request completed in about 125 seconds after streaming support was added; this is one observed run, not a throughput guarantee.
+
+The code and test counts describe the full local working tree, which also contains excluded experiments. They do not imply that every new quality workflow passed a real end-to-end production run. See the [project dossier](docs/portfolio/project-dossier.md), [production evidence](docs/portfolio/production-evidence.md), and [evidence index](docs/portfolio/evidence-index.md) for details.
+
+## Tests
 
 ```powershell
-py -3 orchestrator.py --cycle     # 雷达选品→采纳→写作→质检→包装，全自动
-py -3 orchestrator.py --recommend # 只抓取并自动生成推荐，不写文章
+py -3 -m unittest discover -p "test_*.py"
 ```
 
-### 分步手动跑
+The suite covers parsing, contracts, state transitions, recovery behavior, deterministic checks, repair validation, and packaging. It uses mocks and isolated fixtures for most paths; it does not establish editorial quality or replace a live production smoke test.
 
-```powershell
-py -3 radar.py                              # 1. 选品（默认不含 Royal Road）
-set RADAR_SOURCES=wattpad,inkitt,webnovel,amazon
-py -3 radar.py --sources %RADAR_SOURCES%  # 女性向多源选品（站点不可用时单源失败隔离）
-# Inkitt 若返回 Cloudflare Turnstile，雷达会标记为 error；只有用户自己的授权会话才可通过 INKITT_COOKIE 提供 Cookie
+## Configuration and data
 
-# Inkitt 浏览器桥接（扩展安装一次；雷达会自动启动本地桥接，不需每次手动开 Python 服务）
-# 主雷达请在 Inkitt 首页/广泛发现页运行；主题页只用于子赛道验证，不用于整体份额
-py -3 radar.py --sources inkitt_browser,wattpad,amazon --no-chapters
-py -3 direction_manager.py list             # 2. 看推荐
-py -3 direction_manager.py adopt            # 3. 采纳 top1
-py -3 engine.py --direction-file directions\rec_N.txt --story-id my_story   # 4. 写作（每章默认强制验收、修复、复查）
-# 12 章只是试写批次；审核通过后从已有末章继续追加，例如再写 12 章
-py -3 engine.py --story-id my_story --append-chapters 12   # 追加章同样强制走章节验收
-py -3 native_check.py --story-id my_story --sample 3   # 5. 质检(抽样)
-py -3 packager.py --story-id my_story       # 6. 包装
-```
+Runtime model credentials are read from environment variables. Supply your own provider configuration and credentials; do not commit `.env`, `keys.local.json`, databases, generated manuscripts, logs, or model responses. The repository `.gitignore` excludes common runtime and generated-workspace paths.
 
-### 启动看板（Web 前端）
+The application requires external model and discovery services for production use. Availability, model names, provider APIs, and credentials change over time, so the archived local configuration is not a current service guarantee.
 
-```powershell
-py -3 dashboard.py        # 浏览器打开 http://localhost:8900
-```
+## Portfolio materials
 
-### 量产
+- [Project dossier](docs/portfolio/project-dossier.md)
+- [Resume bullets in Chinese and English](docs/portfolio/resume-bullets.md)
+- [Evidence index and public-data boundary](docs/portfolio/evidence-index.md)
+- [Machine-readable metrics snapshot](docs/portfolio/metrics.json)
 
-```powershell
-py -3 batch_produce.py    # 并行生产 3 部不同题材
-```
+## License
 
-### 盲评（解黑盒）
-
-```powershell
-py -3 blind_review.py     # Gemini 母语级评委分辨 AI/真人
-```
-
-## 质量评测体系
-
-| 层 | 模块 | 指标 |
-|---|---|---|
-| 量化 | quality_probe.py | 字数达标率、AI味密度、Flesch易读性 |
-| 审稿 | native_check.py | 地道性(≥3) + 精彩度(≥2) + 搭配检查 |
-| 盲评 | blind_review.py | Gemini 分辨 AI/真人（解黑盒） |
-
-评分维度可扩展：在 `native_check.py` 的 `SCORING_SPEC` 追加维度即可。
-
-## 模型 profile 封装（profiles.py）
-
-每个模型绑定一个"包"（backend + prompt 策略 + 输出预算），按模型名自动路由：
-
-| 模型类型 | prompt 包 | 说明 |
-|---|---|---|
-| thinking 强模型（gemini-3.1-pro） | minimal 精简包 | 约束反而拖累强模型，只给方向+大纲+字数 |
-| 轻量/普通模型（flash-lite / 3-flash-preview / deepseek） | full 完整包 | 约束（AI味词表/情感缓冲/去模板化）辅助完成 |
-| reasoning 模型（deepseek-v4-pro） | full 完整包 | 接口已留，reasoning 不稳需大 max_tokens |
-
-实测：gemini-3.1-pro 用 full 包 naturalness 3，改用 minimal 包跳到 **5（盲评误判真人）**。
-
-检测端同样封装：`review_with_fallback` 按 reviewers 列表降级（gemini → gpt → glm），GPT 中转恢复后自动接入。
-
-## 关键设计
-
-1. **字数硬校验**：写后数字数，不符带反馈重写（达标率 100%，非 InkOS 软范围）
-2. **world bible**：大纲后生成设定圣经（力量体系/世界规则/人物卡），写章逐章对照
-3. **母语级质检**：Gemini 3.1-pro 官方 key，能挑物理逻辑/感官合理性错误
-4. **盲评回灌闭环**：盲评发现病灶（情感缓冲/模板化/陈词滥调）→ 回灌 prompt → 改进
-5. **模型 profile 自动路由**：thinking 模型无约束包，轻量模型完整约束包，按模型名自动切换
-6. **质量门槛**：`--quality-gate` 每章写后盲评，naturalness < 4 或字数不足则带反馈重写，确保每章稳定达标（把 3.1-pro 的"偶发 naturalness 5"锁成"稳定 ≥4"）
-
-## 已知限制
-
-1. 反馈闭环（卖得好不好回流）暂缓，依赖营销部门数据对接
-2. "读者看不出 AI" 单章验证通过，量产级待确证
-3. GPT 中转不稳定（时好时坏），Gemini 需代理访问
-4. Windows 计划任务未部署，当前手动触发
+No open-source license is currently declared. Do not assume the code is licensed for reuse until a license is added.

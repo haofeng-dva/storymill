@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
-from control_context import build_control_context, load_state_delta
+from control_context import build_control_context, build_repair_context, load_state_delta
 from control_contracts import ControlContractError
 from engine import should_reuse_planning_artifact
 from test_control_contracts import valid_documents
@@ -79,7 +79,26 @@ class ControlContextTests(unittest.TestCase):
             {"id": "permission", "value": "level-3"},
         ])
         self.assertNotIn("relationship_changes", view)
-        self.assertNotIn("open_hooks", view)
+        self.assertEqual(view["hooks"], ["first hook"])
+
+    def test_prior_fact_values_are_capped_so_the_budget_stays_provable(self):
+        """An uncapped fact value makes the control block's worst case unbounded.
+
+        state_delta validation only requires a non-empty string, so without a cap
+        a bundle can pass compile-time preflight and then fail while writing
+        prose, after earlier chapters were already paid for.
+        """
+        from control_context import MAX_PRIOR_FACT_CHARS, _previous_execution_view
+
+        view = _previous_execution_view({
+            "fact_statuses": [
+                {"fact_id": "long", "status": "consistent", "value": "v" * (MAX_PRIOR_FACT_CHARS + 400)},
+                {"fact_id": "short", "status": "consistent", "value": "twelve"},
+            ],
+        })
+        self.assertEqual(len(view["facts"][0]["value"]), MAX_PRIOR_FACT_CHARS)
+        self.assertEqual(view["facts"][0]["id"], "long")
+        self.assertEqual(view["facts"][1], {"id": "short", "value": "twelve"})
 
     def test_state_reader_revalidates_schema_before_handoff(self):
         root = Path("out") / "control_context_state_test"
@@ -103,7 +122,7 @@ class ControlContextTests(unittest.TestCase):
             build_control_context(payload, 1)
 
         payload = bundle()
-        payload["artifacts"]["chapter_contracts"]["chapters"]["0001"]["end_assertions"][0]["claim"] = "x" * 2200
+        payload["artifacts"]["chapter_contracts"]["chapters"]["0001"]["end_assertions"][0]["claim"] = "x" * 5000
         with self.assertRaisesRegex(ControlContractError, "limit"):
             build_control_context(payload, 1)
 
@@ -118,6 +137,30 @@ class ControlContextTests(unittest.TestCase):
         self.assertIn('["ch1-lab-status","sealed"]', result["text"])
         self.assertNotIn("Mara signs and leaves campus.", result["text"])
         self.assertNotIn("Laboratory status", result["text"])
+
+    def test_repair_context_contains_current_contract_and_conservative_temporal_policy(self):
+        payload = bundle()
+        scene = payload["artifacts"]["scene_ledger"]["chapters"]["0001"][0]
+        scene["required_information"] = ["The transfer occurred three hours before Daniel's fatal fall."]
+        second_contract = copy.deepcopy(payload["artifacts"]["chapter_contracts"]["chapters"]["0001"])
+        second_contract["chapter"] = 2
+        payload["artifacts"]["chapter_contracts"]["chapters"]["0002"] = second_contract
+        second_scene = copy.deepcopy(scene)
+        second_scene["scene_id"] = "ch2-only"
+        second_scene["completion_assertion"]["id"] = "ch2-only-complete"
+        second_scene["fact_slots"][0]["id"] = "ch2-only-fact"
+        payload["artifacts"]["scene_ledger"]["chapters"]["0002"] = [second_scene]
+
+        result = build_repair_context(payload, 1)
+
+        self.assertEqual(result["chapter"], 1)
+        self.assertEqual(result["frozen_literal_values"], ["sealed"])
+        self.assertEqual(result["temporal_policy"]["approved_clock_times"], [])
+        self.assertEqual(result["temporal_policy"]["approved_duration_phrases"], ["three hours"])
+        self.assertTrue(result["temporal_policy"]["no_unapproved_clock_times"])
+        self.assertIn("ch1-contract", result["scenes"][0]["scene_id"])
+        self.assertNotIn("ch2-only", json.dumps(result))
+        self.assertEqual(result["opening_contract"]["forcing_event"], "A contract arrives.")
 
 
 if __name__ == "__main__":
