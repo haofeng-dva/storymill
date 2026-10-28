@@ -16,6 +16,7 @@ engine.py — 英文写作引擎（P0 核心）
 模型: 火山方舟 Ark（deepseek-v4-flash 写作 / deepseek-v4-pro 审稿）
 """
 import argparse
+import contextvars
 import json
 import os
 import re
@@ -59,6 +60,54 @@ from story_bible import (
 from story_bible_checks import audit_chapter_facts, planned_fact_slots
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+_ACTIVE_RUN_FINALIZER = contextvars.ContextVar("active_run_finalizer", default=None)
+
+
+class RunFinalizer:
+    """Defer run-ledger writes until the outer main() finally block."""
+
+    def __init__(self, store, run_id, story_id, started_at):
+        self.store = store
+        self.run_id = run_id
+        self.story_id = story_id
+        self.started_at = started_at
+        self.started = False
+        self.status = None
+        self.error = None
+        self.finalized = False
+
+    def __getattr__(self, name):
+        return getattr(self.store, name)
+
+    def start_run(self, run_id, story_id, stage="writing"):
+        started = self.store.start_run(run_id, story_id, stage)
+        self.started = started is not False
+        return started
+
+    def set_outcome(self, status, error=None):
+        if self.started and not self.finalized:
+            self.status = status
+            self.error = error
+
+    def finalize(self, exception=None):
+        if not self.started or self.finalized:
+            return
+        if isinstance(exception, KeyboardInterrupt) or (
+            isinstance(exception, SystemExit) and exception.code in (None, 0)
+        ):
+            self.status = "aborted"
+            self.error = str(exception) or type(exception).__name__
+        elif exception is not None:
+            self.status = "failed"
+            self.error = str(exception) or type(exception).__name__
+        elif self.status is None:
+            self.status = "aborted"
+            self.error = "run exited without recording a terminal status"
+        self.store.finish_run(
+            self.run_id, self.story_id, "writing", self.status,
+            round(time.time() - self.started_at, 1), self.error,
+        )
+        self.finalized = True
 
 
 def chapter_generation_blocks(requested_blocks):
@@ -1645,7 +1694,7 @@ Macro outline for this chapter only:
             )
 
 
-def main():
+def _run_main():
     configure_runtime_streams()
     args = build_argument_parser().parse_args()
 
@@ -1738,10 +1787,11 @@ def main():
         print("--resume 需要同时提供 --run-id")
         sys.exit(1)
     run_id = args.run_id or f"{args.story_id}_{uuid.uuid4().hex[:8]}"
-    task_store = StateStore()
-    chapter_store = ChapterTaskStore(task_store, run_id, args.story_id)
     run_started = time.time()
+    task_store = RunFinalizer(StateStore(), run_id, args.story_id, run_started)
+    chapter_store = ChapterTaskStore(task_store, run_id, args.story_id)
     task_store.start_run(run_id, args.story_id, "writing")
+    _ACTIVE_RUN_FINALIZER.set(task_store)
     engine.llm.set_run_context(run_id, args.story_id, task_store)
     completed_before = {
         int(row["chapter_no"]): row for row in task_store.chapter_tasks(run_id)
@@ -1753,13 +1803,13 @@ def main():
     if args.control_dry_run:
         if not args.controlled_generation:
             print("--control-dry-run requires --controlled-generation")
-            task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), "missing --controlled-generation")
+            task_store.set_outcome("failed", "missing --controlled-generation")
             return 2
         outline_path = os.path.join(out_dir, "outline.md")
         bible_path = os.path.join(out_dir, "world_bible.md")
         if not os.path.exists(outline_path) or not os.path.exists(bible_path):
             print("CONTROL ERROR: --control-dry-run requires existing outline.md and world_bible.md")
-            task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), "missing planning artifacts")
+            task_store.set_outcome("failed", "missing planning artifacts")
             return 2
         outline_text = open(outline_path, encoding="utf-8").read()
         bible_text = open(bible_path, encoding="utf-8").read()
@@ -1772,7 +1822,7 @@ def main():
             )
         except ControlContractError as exc:
             print(f"CONTROL ERROR: {exc}")
-            task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), str(exc))
+            task_store.set_outcome("failed", str(exc))
             return 2
         chapter_range = [args.chapter] if args.chapter > 0 else list(range(1, args.chapters + 1))
         for n in chapter_range:
@@ -1781,10 +1831,10 @@ def main():
                 result = build_control_context(control_bundle, n, previous)
             except ControlContractError as exc:
                 print(f"CONTROL ERROR ch{n}: {exc}")
-                task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), str(exc))
+                task_store.set_outcome("failed", str(exc))
                 return 2
             print(json.dumps(result["diagnostics"], ensure_ascii=False))
-        task_store.finish_run(run_id, args.story_id, "writing", "completed", round(time.time() - run_started, 1), None)
+        task_store.set_outcome("completed")
         print("[control] dry run passed")
         return 0
 
@@ -1805,10 +1855,7 @@ def main():
 
     if args.outline_only:
         print("\n" + outline_text)
-        task_store.finish_run(
-            run_id, args.story_id, "writing", "completed",
-            round(time.time() - run_started, 1), "outline only",
-        )
+        task_store.set_outcome("completed", "outline only")
         return 0
 
     # 2. 设定圣经（world bible）
@@ -1824,7 +1871,7 @@ def main():
             world_bible_source = story_bible_foundation(outline_text)
         except StoryBibleError as exc:
             print(f"STORY BIBLE ERROR: {exc}")
-            task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), str(exc))
+            task_store.set_outcome("failed", str(exc))
             return 2
         bible_path = os.path.join(out_dir, "story_bible_world_bible.md")
         bible_label = "story-bible foundation"
@@ -1853,14 +1900,14 @@ def main():
                 print(f"[story-bible] reusing {len(story_bible_document['facts'])} fixed fact(s)")
             except StoryBibleError as exc:
                 print(f"STORY BIBLE ERROR: {exc}")
-                task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), str(exc))
+                task_store.set_outcome("failed", str(exc))
                 return 2
         else:
             print("[story-bible] compiling fixed facts ...")
             compiled_bible = engine.compile_story_bible(direction, outline_text, bible_text, args.story_id)
             if "error" in compiled_bible:
                 print(f"STORY BIBLE ERROR: {compiled_bible['error']}")
-                task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), compiled_bible["error"])
+                task_store.set_outcome("failed", compiled_bible["error"])
                 return 2
             story_bible_document = compiled_bible["content"]
             save_story_bible(story_bible_path, story_bible_document)
@@ -1868,15 +1915,9 @@ def main():
 
     if args.planning_only:
         if not bible_text:
-            task_store.finish_run(
-                run_id, args.story_id, "writing", "failed",
-                round(time.time() - run_started, 1), "world bible generation failed",
-            )
+            task_store.set_outcome("failed", "world bible generation failed")
             return 1
-        task_store.finish_run(
-            run_id, args.story_id, "writing", "completed",
-            round(time.time() - run_started, 1), "planning only",
-        )
+        task_store.set_outcome("completed", "planning only")
         print("[planning] outline and world bible saved; skipping control compilation and chapter writing")
         return 0
 
@@ -1892,7 +1933,7 @@ def main():
             )
         except ControlContractError as exc:
             print(f"CONTROL ERROR: {exc}")
-            task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), str(exc))
+            task_store.set_outcome("failed", str(exc))
             return 2
         control_runtime = ControlledGenerationRuntime(
             # Control findings and repair routing must point at the same
@@ -1904,9 +1945,9 @@ def main():
                 repair_path = control_runtime.write_repair_request(args.control_repair_card)
             except ControlContractError as exc:
                 print(f"CONTROL REPAIR ERROR: {exc}")
-                task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), str(exc))
+                task_store.set_outcome("failed", str(exc))
                 return 2
-            task_store.finish_run(run_id, args.story_id, "writing", "completed", round(time.time() - run_started, 1), None)
+            task_store.set_outcome("completed")
             print(f"[control] repair request written: {repair_path}")
             return 0
 
@@ -1922,7 +1963,7 @@ def main():
         chapter_range = [n for n in chapter_range if n not in completed_before]
         print(f"[resume] skipping completed chapters: {sorted(completed_before)}; remaining: {chapter_range}")
     if args.resume and not chapter_range:
-        task_store.finish_run(run_id, args.story_id, "writing", "completed", 0, None)
+        task_store.set_outcome("completed")
         print("[resume] all requested chapters are already completed; nothing to do")
         return 0
 
@@ -1930,7 +1971,7 @@ def main():
     if args.chapter_contracts:
         if args.append_chapters:
             print("CHAPTER CONTRACT ERROR: --chapter-contracts does not yet support --append-chapters")
-            task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), "append contracts unsupported")
+            task_store.set_outcome("failed", "append contracts unsupported")
             return 2
         print(f"[contract] compiling frozen requirements for {len(chapter_range)} chapter(s) ...")
         compiled = engine.compile_chapter_contracts(
@@ -1938,7 +1979,7 @@ def main():
         )
         if "error" in compiled:
             print("CHAPTER CONTRACT ERROR:", compiled["error"])
-            task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), compiled["error"])
+            task_store.set_outcome("failed", compiled["error"])
             return 2
         chapter_contract_document = compiled["content"]
         with open(os.path.join(out_dir, ARTIFACT_NAME), "w", encoding="utf-8") as handle:
@@ -1977,7 +2018,7 @@ def main():
                     }
                 except ControlContractError as exc:
                     print(f"CONTROL ERROR: {exc}")
-                    task_store.finish_run(run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), str(exc))
+                    task_store.set_outcome("failed", str(exc))
                     return 2
             elif chapter_contract_document:
                 chapter_requirements = {
@@ -2641,20 +2682,16 @@ def main():
         missing_chapters=status_missing,
     )
     if missing:
-        task_store.finish_run(
-            run_id, args.story_id, "writing", run_status,
-            round(time.time() - run_started, 1), f"missing chapters: {missing}",
-        )
+        task_store.set_outcome(run_status, f"missing chapters: {missing}")
         label = "infrastructure failure" if run_status == "failed_infra" else "partial run"
         print(f"[writing] {label} is not deliverable; skipping summary", flush=True)
         return 2
     if not results:
         print("no chapters written")
+        task_store.set_outcome("failed", "no chapters written")
         return 2
     if args.chapter > 0:
-        task_store.finish_run(
-            run_id, args.story_id, "writing", "completed", round(time.time() - run_started, 1), None,
-        )
+        task_store.set_outcome("completed")
         print(f"[writing] targeted chapter {args.chapter} completed; full-book assembly is deferred", flush=True)
         return 0
     continuity_report = {}
@@ -2677,17 +2714,26 @@ def main():
     if "error" in summ:
         error = summ.get("error", "empty summary response")
         print(f"[FAIL] cn summary generation failed: {error}", flush=True)
-        task_store.finish_run(
-            run_id, args.story_id, "writing", "failed", round(time.time() - run_started, 1), error,
-        )
+        task_store.set_outcome("failed", error)
         return 2
     open(os.path.join(out_dir, "summary_cn.md"), "w", encoding="utf-8").write(summ["content"])
     print("    summary done")
-    task_store.finish_run(
-        run_id, args.story_id, "writing", "completed", round(time.time() - run_started, 1), None,
-    )
+    task_store.set_outcome("completed")
     print(f"\nDONE: {out_dir}")
     return 0
+
+
+def main():
+    token = _ACTIVE_RUN_FINALIZER.set(None)
+    try:
+        return _run_main()
+    finally:
+        try:
+            finalizer = _ACTIVE_RUN_FINALIZER.get()
+            if finalizer is not None:
+                finalizer.finalize(sys.exc_info()[1])
+        finally:
+            _ACTIVE_RUN_FINALIZER.reset(token)
 
 
 if __name__ == "__main__":
