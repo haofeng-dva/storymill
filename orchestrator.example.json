@@ -1,0 +1,60 @@
+{
+  "limits": {
+    "max_stories_per_day": 2,
+    "daily_token_budget": 2000000,
+    "approx_tokens_per_story": 500000
+  },
+  "switches": {
+    "new_short_enabled": true,
+    "serial_enabled": false,
+    "auto_replace_enabled": false
+  },
+  "quality": {
+    "quality_min": 4,
+    "native_min": 4,
+    "engagement_min": 3
+  },
+  "chapter_acceptance": {
+    "enabled": true,
+    "max_repair_rounds": 2,
+    "gpt_model": "gpt-5.5",
+    "gpt_primary_attempts": 1,
+    "gpt_fallback_model": "",
+    "gpt_fallback_attempts": 1,
+    "reviewer_order": ["gpt"],
+    "editorial_findings": false,
+    "contract_evidence_only": true,
+    "glm_contract_max_tokens": 240,
+    "gpt_max_output_tokens": 1400,
+    "gpt_request_timeout_seconds": 300,
+    "gpt_stream": true,
+    "gpt_stream_idle_timeout_seconds": 90,
+    "glm_max_output_tokens": 1400,
+    "glm_attempts": 1,
+    "glm_request_timeout_seconds": 300,
+    "glm_stream": false,
+    "glm_stream_idle_timeout_seconds": 90
+  },
+  "final_editor": {
+    "enabled": false,
+    "timeout_seconds": 7200,
+    "unresolved_remediation_rounds": 2,
+    "dossier_role": "final_editor",
+    "plan_role": "final_editor",
+    "editor_role": "final_editor",
+    "review_role": "final_editor"
+  },
+  "radar": {
+    "sources": "inkitt_browser,inkitt_browser_validation,amazon",
+    "list": 20,
+    "no_chapters": true,
+    "recommend_count": 4,
+    "portfolio": "weighted",
+    "category_mode": "separate_validation"
+  },
+  "notify": {
+    "enabled": false,
+    "channel": "desktop"
+  },
+  "schedule_note": "Use Windows Task Scheduler for periodic radar and production cycles."
+}

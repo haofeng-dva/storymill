@@ -6,6 +6,7 @@ batch_produce.py — 量产（v1 正式版）
 """
 import os
 import subprocess
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -23,7 +24,7 @@ def main():
     for direction, story_id in PRODUCTS:
         log = open(os.path.join(HERE, "logs", f"{story_id}.log"), "w", encoding="utf-8")
         p = subprocess.Popen(
-            ["py", "-3", "engine.py", "--direction", direction,
+            [sys.executable, "engine.py", "--direction", direction,
              "--chapters", "12", "--words", "700", "--story-id", story_id],
             cwd=HERE, stdout=log, stderr=subprocess.STDOUT,
         )

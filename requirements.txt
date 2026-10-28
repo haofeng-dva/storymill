@@ -1,0 +1,2 @@
+# The tracked application and test suite use only the Python standard library.
+# No third-party pip packages are required for the documented setup.

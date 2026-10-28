@@ -45,7 +45,14 @@ def main():
         fails.append("工作区不干净")
 
     # ---- 闸门 2：测试 ----
-    r = sh("py -3 -m unittest discover -p \"test_*.py\"")
+    r = subprocess.run(
+        [sys.executable, "-m", "unittest", "discover", "-p", "test_*.py"],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+    )
     m = re.search(r"Ran (\d+) tests", r.stdout + r.stderr)
     n = m.group(1) if m else "?"
     ok = r.returncode == 0

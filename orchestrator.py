@@ -13,6 +13,7 @@ orchestrator.py — 无人值守调度 + 运维面板（FR-5）
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -34,13 +35,20 @@ def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def python_command(*args):
+    """Build a child-process command with the interpreter running this app."""
+    return [sys.executable, *(str(arg) for arg in args)]
+
+
 def run_step(name, cmd, dry_run=False, timeout=1800):
     """跑一步，返回 (success, output_tail)。"""
-    print(f"  [{name}] {'(dry-run) ' if dry_run else ''}{cmd}", flush=True)
+    cmd = [str(part) for part in cmd]
+    display_cmd = subprocess.list2cmdline(cmd) if os.name == "nt" else shlex.join(cmd)
+    print(f"  [{name}] {'(dry-run) ' if dry_run else ''}{display_cmd}", flush=True)
     if dry_run:
         return True, "(dry-run)"
     try:
-        r = subprocess.run(cmd, shell=True, cwd=HERE, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True, timeout=timeout)
         ok = r.returncode == 0
         tail = (r.stdout or r.stderr or "").strip().splitlines()[-5:]
         return ok, "\n".join(tail)
@@ -71,8 +79,13 @@ def radar_command(cfg):
     portfolio = rcfg.get("portfolio", "weighted")
     if portfolio not in ("weighted", "natural"):
         portfolio = "weighted"
-    no_chapters = " --no-chapters" if rcfg.get("no_chapters", True) else ""
-    return f'py -3 radar.py --sources "{sources}" --list {limit} --recommend-count {recommend_count} --portfolio {portfolio}{no_chapters}'
+    command = python_command(
+        "radar.py", "--sources", sources, "--list", limit,
+        "--recommend-count", recommend_count, "--portfolio", portfolio,
+    )
+    if rcfg.get("no_chapters", True):
+        command.append("--no-chapters")
+    return command
 
 
 def final_editor_run_id():
@@ -88,16 +101,23 @@ def final_editor_command(story_id, review_out, run_id, final_cfg=None, mode="aut
         "review": final_cfg.get("review_role", "reviewer"),
     }
     remediation_rounds = max(0, min(6, int(final_cfg.get("unresolved_remediation_rounds", 2))))
-    artifact_arg = f' --out "{artifact_dir}"' if artifact_dir else ""
-    auto_arg = " --auto" if mode == "auto" else ""
-    return (
-        f'py -3 final_editor.py --story-id {story_id} --run-id {run_id}{auto_arg} --mode {mode}'
-        f'{artifact_arg} '
-        f'--review-report "{review_out}" '
-        f'--dossier-role {roles["dossier"]} --plan-role {roles["plan"]} '
-        f'--editor-role {roles["editor"]} --review-role {roles["review"]} '
-        f'--unresolved-remediation-rounds {remediation_rounds}'
+    command = python_command(
+        "final_editor.py", "--story-id", story_id, "--run-id", run_id,
     )
+    if mode == "auto":
+        command.append("--auto")
+    command.extend([
+        "--mode", mode,
+        "--review-report", review_out or "",
+        "--dossier-role", roles["dossier"],
+        "--plan-role", roles["plan"],
+        "--editor-role", roles["editor"],
+        "--review-role", roles["review"],
+        "--unresolved-remediation-rounds", str(remediation_rounds),
+    ])
+    if artifact_dir:
+        command.extend(["--out", artifact_dir])
+    return command
 
 
 def run_recommend(cfg, dry_run=False):
@@ -144,7 +164,9 @@ def run_cycle(store, cfg, dry_run=False):
         rec_id = 0
     # 2. 采纳推荐
     progress.update("adopt", f"rec {rec_id}")
-    ok, tail = run_step("adopt", f"py -3 direction_manager.py adopt --id {rec_id}", dry_run)
+    ok, tail = run_step(
+        "adopt", python_command("direction_manager.py", "adopt", "--id", rec_id), dry_run,
+    )
     if not ok:
         print(f"  adopt failed: {tail}")
         return {"status": "adopt_failed", "detail": tail}
@@ -157,8 +179,10 @@ def run_cycle(store, cfg, dry_run=False):
     quality_min = cfg.get("quality", {}).get("quality_min", 4)
     ok, tail = run_step(
         "write",
-        f'py -3 engine.py --direction-file "{direction_file}" --story-id {story_id} '
-        f'--quality-gate --quality-min {quality_min}',
+        python_command(
+            "engine.py", "--direction-file", direction_file, "--story-id", story_id,
+            "--quality-gate", "--quality-min", quality_min,
+        ),
         dry_run,
         timeout=7200,
     )
@@ -184,8 +208,10 @@ def run_cycle(store, cfg, dry_run=False):
     review_out = os.path.join("out", story_id, "native_check_result.json")
     ok, tail = run_step(
         "verify",
-        f'py -3 native_check.py --story-id {story_id} --require-quality-gate '
-        f'--fail-on-editorial-findings --out "{review_out}"',
+        python_command(
+            "native_check.py", "--story-id", story_id, "--require-quality-gate",
+            "--fail-on-editorial-findings", "--out", review_out,
+        ),
         dry_run,
         timeout=3600,
     )
@@ -194,7 +220,10 @@ def run_cycle(store, cfg, dry_run=False):
         cards_out = os.path.join("out", story_id, "repair_cards.json")
         cards_ok, cards_tail = run_step(
             "repair-cards",
-            f'py -3 repair_pipeline.py --story-id {story_id} --report "{review_out}" --out "{cards_out}"',
+            python_command(
+                "repair_pipeline.py", "--story-id", story_id, "--report", review_out,
+                "--out", cards_out,
+            ),
             dry_run,
             timeout=900,
         )
@@ -212,8 +241,10 @@ def run_cycle(store, cfg, dry_run=False):
         progress.update("repairing", story_id)
         drafts_ok, drafts_tail = run_step(
             "repair-plan-draft",
-            f'py -3 repair_pipeline.py --story-id {story_id} --report "{review_out}" '
-            f'--out "{cards_out}" --resume --plan --draft',
+            python_command(
+                "repair_pipeline.py", "--story-id", story_id, "--report", review_out,
+                "--out", cards_out, "--resume", "--plan", "--draft",
+            ),
             dry_run,
             timeout=3600,
         )
@@ -223,7 +254,10 @@ def run_cycle(store, cfg, dry_run=False):
         apply_out = os.path.join("out", story_id, "repair_apply.json")
         applied_ok, applied_tail = run_step(
             "repair-apply",
-            f'py -3 apply_repair_drafts.py --story-id {story_id} --cards "{cards_out}" --out "{apply_out}"',
+            python_command(
+                "apply_repair_drafts.py", "--story-id", story_id, "--cards", cards_out,
+                "--out", apply_out,
+            ),
             dry_run,
             timeout=900,
         )
@@ -235,8 +269,10 @@ def run_cycle(store, cfg, dry_run=False):
         recheck_out = review_out
         recheck_ok, recheck_tail = run_step(
             "repair-verify",
-            f'py -3 native_check.py --story-id {story_id} --require-quality-gate '
-            f'--fail-on-editorial-findings --out "{recheck_out}"',
+            python_command(
+                "native_check.py", "--story-id", story_id, "--require-quality-gate",
+                "--fail-on-editorial-findings", "--out", recheck_out,
+            ),
             dry_run,
             timeout=3600,
         )
@@ -281,7 +317,9 @@ def run_cycle(store, cfg, dry_run=False):
     # 5. 包装
     progress.update("packaging", package_story_id)
     ok2, tail2 = run_step(
-        "package", f"py -3 packager.py --story-id {package_story_id} --require-quality-gate", dry_run,
+        "package",
+        python_command("packager.py", "--story-id", package_story_id, "--require-quality-gate"),
+        dry_run,
     )
     if not ok2:
         print(f"  package failed: {tail2}")

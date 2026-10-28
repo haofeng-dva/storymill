@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 from urllib.parse import urlparse, parse_qs
 
@@ -204,7 +205,7 @@ def trigger_cycle():
     """后台触发一次全自动生产循环（选品→自动采纳→写作→质检→包装）。"""
     def _run():
         p = subprocess.Popen(
-            ["py", "-3", "orchestrator.py", "--cycle"],
+            [sys.executable, "orchestrator.py", "--cycle"],
             cwd=HERE, stdout=open(os.path.join(HERE, "logs", "cycle.out"), "a", encoding="utf-8"),
             stderr=subprocess.STDOUT,
         )
@@ -229,7 +230,7 @@ def trigger_custom(direction):
     os.makedirs(os.path.join(HERE, "logs"), exist_ok=True)
     def _run():
         p = subprocess.Popen(
-            ["py", "-3", "engine.py", "--direction-file", fpath, "--story-id", story_id,
+            [sys.executable, "engine.py", "--direction-file", fpath, "--story-id", story_id,
              "--quality-gate", "--quality-min", str(qmin)],
             cwd=HERE, stdout=open(os.path.join(HERE, "logs", f"{story_id}.out"), "a", encoding="utf-8"),
             stderr=subprocess.STDOUT,
@@ -523,7 +524,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif u.path == "/api/cycle":
             self._send(json.dumps(trigger_cycle(), ensure_ascii=False))
         elif u.path == "/api/report":
-            subprocess.Popen(["py", "-3", "orchestrator.py", "--report"], cwd=HERE)
+            subprocess.Popen([sys.executable, "orchestrator.py", "--report"], cwd=HERE)
             self._send(json.dumps({"ok": True, "msg": "report triggered"}, ensure_ascii=False))
         else:
             self._send(json.dumps({"error": "not found"}), 404)
