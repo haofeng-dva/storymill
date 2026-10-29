@@ -65,9 +65,10 @@ def check_limits(store, cfg):
     m = store.metrics_today()
     if m["stories"] >= cfg["limits"]["max_stories_per_day"]:
         return False, f"daily cap reached ({m['stories']}/{cfg['limits']['max_stories_per_day']})"
-    approx = m["tokens"] + cfg["limits"]["approx_tokens_per_story"]
-    if approx > cfg["limits"]["daily_token_budget"]:
-        return False, f"token budget would exceed ({approx}/{cfg['limits']['daily_token_budget']})"
+    budget = int(cfg.get("limits", {}).get("daily_token_budget", 2_000_000))
+    used = int(m.get("tokens", 0) or 0)
+    if used >= budget:
+        return False, f"今日 token 预算已用完（已用 {used} / 上限 {budget}）"
     return True, ""
 
 
@@ -321,14 +322,11 @@ def run_cycle(store, cfg, dry_run=False):
         python_command("packager.py", "--story-id", package_story_id, "--require-quality-gate"),
         dry_run,
     )
+    if not dry_run:
+        store.record_story()
     if not ok2:
         print(f"  package failed: {tail2}")
         return {"status": "package_failed", "story_id": package_story_id, "detail": tail2}
-
-    # 6. 记录 metrics
-    if not dry_run:
-        store.record_story()
-        store.add_tokens(cfg["limits"]["approx_tokens_per_story"])
 
     print(f"  DONE: story_id={package_story_id}, verify={'ok' if verify_ok else 'failed'}")
     progress.update("done", f"verify={'ok' if verify_ok else 'failed'}", package_story_id)

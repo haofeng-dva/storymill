@@ -137,6 +137,8 @@ class StateStore:
           day TEXT PRIMARY KEY,
           stories INTEGER DEFAULT 0,
           tokens INTEGER DEFAULT 0,
+          llm_calls INTEGER DEFAULT 0,
+          runs INTEGER DEFAULT 0,
           cost_yuan REAL DEFAULT 0
         );
         """)
@@ -157,6 +159,26 @@ class StateStore:
             if column not in llm_columns:
                 self.db.execute(f"ALTER TABLE llm_calls ADD COLUMN {column} "
                                 + ("INTEGER" if column != "purpose" else "TEXT"))
+        self.db.commit()
+        metric_columns = {r[1] for r in self.db.execute("PRAGMA table_info(metrics)").fetchall()}
+        for column in ("llm_calls", "runs"):
+            if column not in metric_columns:
+                self.db.execute(f"ALTER TABLE metrics ADD COLUMN {column} INTEGER DEFAULT 0")
+        # Older builds stored estimated per-story tokens. llm_calls is the
+        # source of truth, so rebuild token and call totals from its records.
+        self.db.execute(
+            "INSERT INTO metrics (day, tokens, llm_calls) "
+            "SELECT substr(created_at, 1, 10), COALESCE(SUM(tokens), 0), "
+            "SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) "
+            "FROM llm_calls GROUP BY substr(created_at, 1, 10) "
+            "ON CONFLICT(day) DO UPDATE SET tokens=excluded.tokens, llm_calls=excluded.llm_calls"
+        )
+        self.db.execute(
+            "INSERT INTO metrics (day, runs) "
+            "SELECT substr(created_at, 1, 10), COUNT(*) FROM runs "
+            "GROUP BY substr(created_at, 1, 10) "
+            "ON CONFLICT(day) DO UPDATE SET runs=excluded.runs"
+        )
         self.db.commit()
 
     # ---- chapter task state ----
@@ -216,6 +238,15 @@ class StateStore:
                 (run_id, story_id, chapter_no, role, model, backend, status, elapsed_s,
                  tokens, error, attempt, purpose, retry_index, now_iso()),
             )
+            successful = status == "completed"
+            token_count = int(tokens or 0) if successful else 0
+            day = today()
+            self.db.execute(
+                "INSERT INTO metrics (day, tokens, llm_calls) VALUES (?, ?, ?) "
+                "ON CONFLICT(day) DO UPDATE SET tokens = tokens + ?, "
+                "llm_calls = llm_calls + ?",
+                (day, token_count, int(successful), token_count, int(successful)),
+            )
             self.db.commit()
 
     def latest_completed_chapters(self, story_id):
@@ -238,6 +269,12 @@ class StateStore:
             self.db.execute(
                 "INSERT INTO runs (run_id, story_id, stage, status, created_at) VALUES (?, ?, ?, 'running', ?)",
                 (run_id, story_id, stage, now_iso()),
+            )
+            day = today()
+            self.db.execute(
+                "INSERT INTO metrics (day, runs) VALUES (?, 1) "
+                "ON CONFLICT(day) DO UPDATE SET runs = runs + 1",
+                (day,),
             )
             self.db.commit()
             return True
