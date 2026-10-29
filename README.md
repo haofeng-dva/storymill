@@ -31,7 +31,7 @@ test_*.py                        regression and contract tests
 ## Evidence snapshot
 
 - The Git checkout contains the application, configuration, documentation, and 30 test modules. Local experiments, generated stories, databases, credentials, and one-off helper scripts are not part of the checkout.
-- Current regression run: 375 tests passed with `py -3 -m unittest discover -p "test_*.py"` on Python 3.13.14; existing `ResourceWarning` messages remain.
+- Current regression run: 390 tests passed with `py -3 -m unittest discover -p "test_*.py"` on Python 3.13.14; existing `ResourceWarning` messages remain.
 - A documented production sample contains 12 chapters and approximately 30,474 words. A later editorial assessment recorded 19 issue groups and about 45 text-level issues, so it was not considered ready for release.
 - Three local portfolio runs contain complete 12-chapter manuscripts of roughly 30,000 words each. Their story text and runtime artifacts are excluded from this repository.
 - A historical long request completed in about 125 seconds after streaming support was added; this is one observed run, not a throughput guarantee.
@@ -40,33 +40,29 @@ The test result describes a local run. It does not imply that every quality work
 
 ## Quick start
 
-The documented setup targets Windows and CPython 3.13. The current checkout was tested with Python 3.13.14. The tracked application and test suite use the Python standard library; `requirements.txt` records that no third-party pip packages are needed.
+The documented setup targets Windows and Python 3.10 or newer. The current checkout was tested with Python 3.13.14. The tracked application and test suite use the Python standard library; `requirements.txt` records that no third-party pip packages are needed.
 
-From PowerShell, clone the repository and create an isolated environment:
+From PowerShell, clone the repository and run the local checks. No package installation is needed:
 
 ```powershell
 git clone https://github.com/haofeng-dva/storymill.git
 cd storymill
-py -3.13 -m venv .venv
-# The tracked code has no third-party packages. Run this when pip is available
-# to verify the declared dependency file; otherwise skip this line.
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m unittest discover -p "test_*.py"
+py -3 tools/check.py
 ```
 
 Check the command-line entry point without contacting an external service:
 
 ```powershell
-.\.venv\Scripts\python.exe engine.py --help
+py -3 engine.py --help
 ```
 
 To open the local operator dashboard:
 
 ```powershell
-.\.venv\Scripts\python.exe dashboard.py
+py -3 dashboard.py
 ```
 
-Then visit `http://localhost:8900`. The dashboard and its Python child processes use the same interpreter from `.venv`.
+Then visit `http://localhost:8900`.
 
 ## Configuration and credentials
 
@@ -90,7 +86,7 @@ The ignored `node_modules` junction sometimes present in the development workspa
 ## Tests
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -p "test_*.py"
+py -3 -m unittest discover -p "test_*.py"
 ```
 
 The suite covers parsing, contracts, state transitions, recovery behavior, deterministic checks, repair validation, and packaging. It uses mocks and isolated fixtures for most paths; it does not establish editorial quality or replace a live production smoke test.
