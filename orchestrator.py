@@ -18,7 +18,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-from state_store import StateStore, today
+from state_store import StateStore, check_token_budget, today
 import progress
 from writing_status import is_deliverable, load_status
 
@@ -65,10 +65,13 @@ def check_limits(store, cfg):
     m = store.metrics_today()
     if m["stories"] >= cfg["limits"]["max_stories_per_day"]:
         return False, f"daily cap reached ({m['stories']}/{cfg['limits']['max_stories_per_day']})"
-    budget = int(cfg.get("limits", {}).get("daily_token_budget", 2_000_000))
-    used = int(m.get("tokens", 0) or 0)
-    if used >= budget:
-        return False, f"今日 token 预算已用完（已用 {used} / 上限 {budget}）"
+    ok, reason = check_token_budget(
+        store,
+        cfg.get("limits", {}).get("daily_token_budget", 2_000_000),
+        cfg.get("limits", {}).get("approx_tokens_per_story", 500_000),
+    )
+    if not ok:
+        return False, reason
     return True, ""
 
 

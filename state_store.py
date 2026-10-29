@@ -32,6 +32,17 @@ def today():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def check_token_budget(store, budget, estimate):
+    """Return whether another run fits within today's configured token budget."""
+    metrics_today = getattr(store, "metrics_today", None)
+    used = int(metrics_today().get("tokens", 0) or 0) if metrics_today else 0
+    budget = int(budget)
+    estimate = max(0, int(estimate or 0))
+    if used + estimate > budget:
+        return False, f"今日 token 预算不足（已用 {used} + 预计 {estimate} / 上限 {budget}）"
+    return True, ""
+
+
 class StateStore:
     def __init__(self, db_path=None):
         self.db_path = db_path or DEFAULT_DB
@@ -178,6 +189,10 @@ class StateStore:
             "SELECT substr(created_at, 1, 10), COUNT(*) FROM runs "
             "GROUP BY substr(created_at, 1, 10) "
             "ON CONFLICT(day) DO UPDATE SET runs=excluded.runs"
+        )
+        self.db.execute(
+            "DELETE FROM metrics WHERE NOT EXISTS ("
+            "SELECT 1 FROM llm_calls WHERE substr(llm_calls.created_at, 1, 10)=metrics.day)"
         )
         self.db.commit()
 

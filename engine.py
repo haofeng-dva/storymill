@@ -29,7 +29,7 @@ import uuid
 
 import progress
 from profiles import get_writer_profile
-from state_store import StateStore
+from state_store import StateStore, check_token_budget
 import quality_checks
 import quality_gate
 from distill.experience_runtime import ExperienceRuntime
@@ -108,6 +108,20 @@ class RunFinalizer:
             round(time.time() - self.started_at, 1), self.error,
         )
         self.finalized = True
+
+
+def start_writing_run(store, run_id, story_id, started_at, limits):
+    allowed, reason = check_token_budget(
+        store,
+        limits.get("daily_token_budget", 2_000_000),
+        limits.get("approx_tokens_per_story", 500_000),
+    )
+    if not allowed:
+        print(reason)
+        return None
+    finalizer = RunFinalizer(store, run_id, story_id, started_at)
+    finalizer.start_run(run_id, story_id, "writing")
+    return finalizer
 
 
 def chapter_generation_blocks(requested_blocks):
@@ -1795,9 +1809,23 @@ def _run_main():
         sys.exit(1)
     run_id = args.run_id or f"{args.story_id}_{uuid.uuid4().hex[:8]}"
     run_started = time.time()
-    task_store = RunFinalizer(StateStore(), run_id, args.story_id, run_started)
+    store = StateStore()
+    try:
+        try:
+            with open(os.path.join(HERE, "orchestrator.json"), encoding="utf-8") as f:
+                limits = json.load(f).get("limits", {})
+        except FileNotFoundError:
+            limits = {}
+        task_store = start_writing_run(store, run_id, args.story_id, run_started, limits)
+        if task_store is None:
+            if hasattr(store, "close"):
+                store.close()
+            return 2
+    except Exception:
+        if hasattr(store, "close"):
+            store.close()
+        raise
     chapter_store = ChapterTaskStore(task_store, run_id, args.story_id)
-    task_store.start_run(run_id, args.story_id, "writing")
     _ACTIVE_RUN_FINALIZER.set(task_store)
     engine.llm.set_run_context(run_id, args.story_id, task_store)
     completed_before = {

@@ -6,7 +6,8 @@ import unittest
 from unittest.mock import patch
 
 import orchestrator
-from state_store import StateStore, today
+from engine import start_writing_run
+from state_store import StateStore, check_token_budget, today
 
 
 class S4UsageBudgetTests(unittest.TestCase):
@@ -42,7 +43,58 @@ class S4UsageBudgetTests(unittest.TestCase):
             Store(), {"switches": {"new_short_enabled": True}, "limits": {"max_stories_per_day": 2, "daily_token_budget": 12}},
         )
         self.assertFalse(ok)
-        self.assertIn("已用 12 / 上限 12", reason)
+        self.assertIn("已用 12", reason)
+        self.assertIn("上限 12", reason)
+
+    def test_budget_gate_rejects_predicted_single_run_overage(self):
+        class Store:
+            def metrics_today(self):
+                return {"tokens": 1_900_000}
+
+        ok, reason = check_token_budget(Store(), 2_000_000, 500_000)
+        self.assertFalse(ok)
+        self.assertIn("预计 500000", reason)
+
+    def test_engine_start_path_rejects_before_start_run(self):
+        class Store:
+            def __init__(self):
+                self.closed = False
+                self.started = False
+
+            def metrics_today(self):
+                return {"tokens": 1_900_000}
+
+            def start_run(self, *_args):
+                self.started = True
+
+            def close(self):
+                self.closed = True
+
+        store = Store()
+        result = start_writing_run(
+            store, "run-1", "story-1", 0,
+            {"daily_token_budget": 2_000_000, "approx_tokens_per_story": 500_000},
+        )
+        self.assertIsNone(result)
+        self.assertFalse(store.started)
+
+    def test_migration_removes_metrics_days_without_llm_calls(self):
+        db_path = os.path.join(os.path.dirname(__file__), f".test_s4_orphan_{os.getpid()}.db")
+        try:
+            store = StateStore(db_path)
+            store.db.execute("INSERT INTO metrics (day, tokens) VALUES ('2026-08-13', 500000)")
+            store.db.commit()
+            store.close()
+            reopened = StateStore(db_path)
+            self.assertIsNone(reopened.db.execute(
+                "SELECT 1 FROM metrics WHERE day='2026-08-13'"
+            ).fetchone())
+            reopened.close()
+        finally:
+            if "reopened" in locals():
+                reopened.close()
+            if os.path.exists(db_path):
+                os.remove(db_path)
 
     def test_package_failure_still_records_story(self):
         class Store:
