@@ -532,8 +532,8 @@ class LLM:
         )
         t0 = time.time()
         data = None
-        # 路3：5xx/429/timeout 全部纳入重试，指数退避 5/15/45/90s，避免单次波动丢章
-        retry_codes = (400, 429, 500, 502, 503, 504)
+        # 4xx 永不重试，408/429 除外；5xx/timeout 使用指数退避。
+        retry_codes = (408, 429, 500, 502, 503, 504)
         retry_sleeps = (5, 15, 45, 90)
         for attempt in range(5):
             result = {}
@@ -565,7 +565,7 @@ class LLM:
                     if code in retry_codes and attempt < 4:
                         time.sleep(retry_sleeps[attempt])
                         continue
-                    return {"error": f"HTTP {code}: {msg}"}
+                    return {"error": f"HTTP {code}: {msg}", "http_status": code}
                 if attempt == 4:
                     return {"error": f"{code}: {msg}"}
                 time.sleep(retry_sleeps[attempt])
@@ -605,7 +605,8 @@ class LLM:
             data=json.dumps(body).encode("utf-8"),
             headers=self._relay_headers(),
         )
-        retry_codes = (429, 500, 502, 503, 504)
+        # 4xx 永不重试，408/429 除外；5xx/timeout 使用指数退避。
+        retry_codes = (408, 429, 500, 502, 503, 504)
         retry_sleeps = (5, 15, 45, 90)
         max_attempts = max(1, min(int(max_attempts), 5))
         request_timeout = max(1, int(request_timeout))
@@ -691,13 +692,10 @@ class LLM:
                 return {"error": error}
             if "http_error" in result:
                 code, error_body = result["http_error"]
-                # This relay intermittently returns a bare gateway page as a
-                # 404. Do not retry real API/model 404s such as model_not_found.
-                transient_gateway_404 = code == 404 and error_body.strip().lower() == "404 page not found"
-                if (code in retry_codes or transient_gateway_404) and attempt < max_attempts - 1:
+                if code in retry_codes and attempt < max_attempts - 1:
                     time.sleep(retry_sleeps[attempt])
                     continue
-                return {"error": f"HTTP {code}: {error_body}"}
+                return {"error": f"HTTP {code}: {error_body}", "http_status": code}
             if "exception" in result:
                 name, message = result["exception"]
                 if attempt < max_attempts - 1:
@@ -780,7 +778,10 @@ class LLM:
         if "error" not in result and not (result.get("content") or "").strip():
             result = {**result, "error": "model returned empty output", "failure_type": FailureType.EMPTY_OUTPUT.value}
         if "error" in result:
-            result.setdefault("failure_type", classify_failure(result.get("error")))
+            result.setdefault(
+                "failure_type",
+                classify_failure(result.get("error"), http_status=result.get("http_status")),
+            )
         if "error" in result and using_primary_model and fallback_model and fallback_model != model:
             self._record_call(role, model, backend, result, started)
             # A relay failure is role-wide for this run. Do not spend another
@@ -799,7 +800,13 @@ class LLM:
             if "error" not in fallback_result and not (fallback_result.get("content") or "").strip():
                 fallback_result = {**fallback_result, "error": "model returned empty output"}
             if "error" in fallback_result:
-                fallback_result.setdefault("failure_type", classify_failure(fallback_result.get("error")))
+                fallback_result.setdefault(
+                    "failure_type",
+                    classify_failure(
+                        fallback_result.get("error"),
+                        http_status=fallback_result.get("http_status"),
+                    ),
+                )
             result = {**fallback_result, "fallback_from": model}
             model, backend, started = fallback_model, fallback_backend, fallback_started
         self._record_call(role, model, backend, result, started)

@@ -159,11 +159,11 @@ class ControlRuntimeReplayTests(unittest.TestCase):
         self.assertIn("not a verbatim chapter quotation", runtime.last_state_failure)
         self.assertEqual(runtime.last_state_failure_type, "quality_failure")
 
-    def test_transport_error_retains_network_failure_type(self):
+    def test_permanent_http_404_is_not_classified_as_transport_failure(self):
         runtime = self._runtime(Path("runtime-test"))
         text = "Mara accepts the contract. Mara finds the sealed laboratory inaccessible."
         self.assertFalse(runtime.record_state_delta(1, text, {"error": "HTTP 404: 404 page not found"}))
-        self.assertEqual(runtime.last_state_failure_type, "network_error")
+        self.assertEqual(runtime.last_state_failure_type, "model_error")
 
     def test_explicit_scene_card_builds_a_minimal_repair_request(self):
         root = Path("out") / "control_runtime_repair_test_output"

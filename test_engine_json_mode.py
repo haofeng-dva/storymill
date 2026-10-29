@@ -260,6 +260,84 @@ class JsonModeTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 2)
         sleep.assert_called_once_with(5)
 
+    def test_chat_completions_retries_http_429(self):
+        llm = LLM({"llm": {
+            "base_url": "https://example.invalid/v1", "api_key_env": "TEST_KEY",
+            "models": {"writer": "gpt-5.6-sol"},
+            "relay": {"role_wire_apis": {"writer": "chat_completions"}},
+        }})
+        llm.relay_base = "https://relay.example"
+        llm.relay_key = "key"
+        error = urllib.error.HTTPError(
+            "https://relay.example/v1/chat/completions", 429,
+            "Too Many Requests", {}, _HttpErrorResponse(),
+        )
+        with patch("urllib.request.urlopen", side_effect=[error, _Response()]) as urlopen:
+            with patch("engine.time.sleep") as sleep:
+                result = llm.chat("writer", [{"role": "user", "content": "x"}], 10, 0.1)
+        self.assertEqual(result["content"], "{}")
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(5)
+
+    def test_chat_completions_retries_http_503(self):
+        llm = LLM({"llm": {
+            "base_url": "https://example.invalid/v1", "api_key_env": "TEST_KEY",
+            "models": {"writer": "gpt-5.6-sol"},
+            "relay": {"role_wire_apis": {"writer": "chat_completions"}},
+        }})
+        llm.relay_base = "https://relay.example"
+        llm.relay_key = "key"
+        error = urllib.error.HTTPError(
+            "https://relay.example/v1/chat/completions", 503,
+            "Service Unavailable", {}, _HttpErrorResponse(),
+        )
+        with patch("urllib.request.urlopen", side_effect=[error, _Response()]) as urlopen:
+            with patch("engine.time.sleep") as sleep:
+                result = llm.chat("writer", [{"role": "user", "content": "x"}], 10, 0.1)
+        self.assertEqual(result["content"], "{}")
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(5)
+
+    def test_chat_completions_does_not_retry_permanent_http_400(self):
+        llm = LLM({"llm": {
+            "base_url": "https://example.invalid/v1", "api_key_env": "TEST_KEY",
+            "models": {"writer": "gpt-5.6-sol"},
+            "relay": {"role_wire_apis": {"writer": "chat_completions"}},
+        }})
+        llm.relay_base = "https://relay.example"
+        llm.relay_key = "key"
+        error = urllib.error.HTTPError(
+            "https://relay.example/v1/chat/completions", 400,
+            "Bad Request", {}, _HttpErrorResponse(),
+        )
+        with patch("urllib.request.urlopen", side_effect=error) as urlopen:
+            with patch("engine.time.sleep") as sleep:
+                result = llm.chat("writer", [{"role": "user", "content": "x"}], 10, 0.1)
+        self.assertEqual(result["http_status"], 400)
+        self.assertEqual(result["failure_type"], "model_error")
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_chat_completions_does_not_retry_permanent_http_401(self):
+        llm = LLM({"llm": {
+            "base_url": "https://example.invalid/v1", "api_key_env": "TEST_KEY",
+            "models": {"writer": "gpt-5.6-sol"},
+            "relay": {"role_wire_apis": {"writer": "chat_completions"}},
+        }})
+        llm.relay_base = "https://relay.example"
+        llm.relay_key = "key"
+        error = urllib.error.HTTPError(
+            "https://relay.example/v1/chat/completions", 401,
+            "Unauthorized", {}, _HttpErrorResponse(),
+        )
+        with patch("urllib.request.urlopen", side_effect=error) as urlopen:
+            with patch("engine.time.sleep") as sleep:
+                result = llm.chat("writer", [{"role": "user", "content": "x"}], 10, 0.1)
+        self.assertEqual(result["http_status"], 401)
+        self.assertEqual(result["failure_type"], "model_error")
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+
     def test_writer_chat_streams_content_without_reasoning_trace(self):
         llm = LLM({"llm": {
             "base_url": "https://example.invalid/v1", "api_key_env": "TEST_KEY",
@@ -331,7 +409,7 @@ class JsonModeTests(unittest.TestCase):
             )
         self.assertEqual(result["error"], "HTTP HANG: chat completion request stuck >15s")
 
-    def test_chat_completions_retries_only_the_known_transient_404_page(self):
+    def test_chat_completions_does_not_retry_permanent_http_404(self):
         llm = LLM({"llm": {
             "base_url": "https://example.invalid/v1", "api_key_env": "TEST_KEY",
             "models": {"writer": "gpt-5.6-sol"},
@@ -343,12 +421,13 @@ class JsonModeTests(unittest.TestCase):
             "https://relay.example/v1/chat/completions", 404,
             "Not Found", {}, _Transient404Response(),
         )
-        with patch("urllib.request.urlopen", side_effect=[error, _Response()]) as urlopen:
+        with patch("urllib.request.urlopen", side_effect=error) as urlopen:
             with patch("engine.time.sleep") as sleep:
                 result = llm.chat("writer", [{"role": "user", "content": "x"}], 10, 0.1)
-        self.assertEqual(result["content"], "{}")
-        self.assertEqual(urlopen.call_count, 2)
-        sleep.assert_called_once_with(5)
+        self.assertEqual(result["http_status"], 404)
+        self.assertEqual(result["failure_type"], "model_error")
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
 
     def test_writer_falls_back_to_gpt55_after_one_gpt56_retry(self):
         llm = LLM({"llm": {

@@ -57,14 +57,33 @@ TRANSIENT_INFRASTRUCTURE_FAILURE_TYPES = {
 }
 
 
-def classify_failure(error=None, *, content=None, word_count=None, word_min=None,
-                     word_max=None, quality=None, quality_min=None, file_error=False):
+def classify_failure(error=None, *, http_status=None, content=None, word_count=None,
+                     word_min=None, word_max=None, quality=None, quality_min=None,
+                     file_error=False):
     if file_error:
         return FailureType.FILE.value
     if error:
+        if http_status is None:
+            if isinstance(error, dict):
+                http_status = error.get("http_status")
+                error = error.get("error")
+            else:
+                http_status = getattr(error, "code", None)
         msg = str(error).lower()
-        # Bodies take precedence over HTTP status: the relay uses 502 both for
-        # a permanently forbidden route and for ordinary gateway failures.
+        try:
+            http_status = int(http_status) if http_status is not None else None
+        except (TypeError, ValueError):
+            http_status = None
+        # An explicit status code is authoritative; inspect message text only
+        # when callers cannot provide one.
+        if http_status is not None:
+            if http_status in (408, 429) or http_status >= 500:
+                if http_status == 504:
+                    return FailureType.GATEWAY_TIMEOUT.value
+                return FailureType.NETWORK.value
+            if 400 <= http_status < 500:
+                return FailureType.MODEL.value
+
         if "upstream access forbidden" in msg:
             return FailureType.ROUTE_FORBIDDEN.value
         if any(x in msg for x in ("model_not_found", "model not found", "not supported by any configured account")):
@@ -77,7 +96,7 @@ def classify_failure(error=None, *, content=None, word_count=None, word_min=None
             return FailureType.UPSTREAM_TIMEOUT.value
         if any(x in msg for x in (
             "streaminterruptederror", "stream ended without a terminal event",
-            "http", "urlerror", "connection", "503", "502", "429",
+            "urlerror", "connection", "503", "502", "429",
         )):
             return FailureType.NETWORK.value
         return FailureType.MODEL.value

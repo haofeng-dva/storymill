@@ -3,6 +3,8 @@ import sqlite3
 import tempfile
 import unittest
 
+import urllib.error
+
 from chapter_state import (
     classify_failure, is_auto_retryable, is_infrastructure_failure,
     is_recoverable, is_transient_infrastructure_failure,
@@ -72,7 +74,7 @@ class P0StateAndAuditTests(unittest.TestCase):
         self.assertEqual(classify_failure("HTTP 503"), "network_error")
         self.assertEqual(classify_failure("HTTP 502: upstream access forbidden"), "route_forbidden")
         self.assertEqual(classify_failure("HTTP 404: model_not_found"), "model_not_found")
-        self.assertEqual(classify_failure("HTTP 404: 404 page not found"), "network_error")
+        self.assertEqual(classify_failure("HTTP 404: 404 page not found"), "model_error")
         self.assertEqual(classify_failure("HTTP 504: Gateway Time-out"), "gateway_timeout")
         self.assertEqual(
             classify_failure("StreamInterruptedError: stream ended without a terminal event"),
@@ -89,6 +91,13 @@ class P0StateAndAuditTests(unittest.TestCase):
         self.assertTrue(is_auto_retryable("network_error"))
         self.assertTrue(is_auto_retryable("gateway_timeout"))
         self.assertTrue(is_auto_retryable(classify_failure("StreamInterruptedError: stream ended without a terminal event")))
+        self.assertEqual(classify_failure("HTTP 400: too large"), "model_error")
+        self.assertEqual(classify_failure("HTTP 401: unauthorized"), "model_error")
+        self.assertEqual(classify_failure(urllib.error.HTTPError("https://x", 400, "too large", {}, None)), "model_error")
+        self.assertEqual(classify_failure(urllib.error.HTTPError("https://x", 401, "unauthorized", {}, None)), "model_error")
+        self.assertTrue(is_auto_retryable(classify_failure("HTTP 429: rate limited")))
+        self.assertTrue(is_auto_retryable(classify_failure("HTTP 503: unavailable")))
+        self.assertEqual(classify_failure({"error": "request failed", "http_status": 400}), "model_error")
         self.assertFalse(is_auto_retryable("route_forbidden"))
         self.assertFalse(is_auto_retryable("model_error"))
         self.assertFalse(is_auto_retryable("word_count_failure"))
